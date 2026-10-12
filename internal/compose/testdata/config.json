@@ -1,0 +1,31 @@
+{
+  "name": "aviary-wt-abc123",
+  "services": {
+    "postgres": {
+      "image": "postgis/postgis:17-3.5",
+      "volumes": [
+        {"type": "volume", "source": "postgres", "target": "/var/lib/postgresql/data"}
+      ]
+    },
+    "diamond": {
+      "image": "diamond:latest",
+      "volumes": [
+        {"type": "bind", "source": "/work/wt/src/diamond", "target": "/app"},
+        {"type": "volume", "source": "postgres", "target": "/pgdata", "read_only": true}
+      ]
+    },
+    "redis": {
+      "image": "redis:7",
+      "volumes": [
+        {"type": "volume", "source": "redis-data", "target": "/data"}
+      ]
+    },
+    "client": {
+      "image": "alpine:3"
+    }
+  },
+  "volumes": {
+    "postgres": {"name": "aviary-wt-abc123_postgres"},
+    "redis-data": {"name": "aviary-wt-abc123_redis-data"}
+  }
+}
