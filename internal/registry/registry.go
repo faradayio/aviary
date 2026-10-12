@@ -1,0 +1,275 @@
+// Package registry records every stack aviary has set up on this machine
+// and the host ports each one owns, so worktrees never collide and stale
+// stacks can be found after their worktree is gone.
+package registry
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"syscall"
+	"time"
+
+	"github.com/gofrs/flock"
+)
+
+// Version is the registry file layout this build reads and writes. A file
+// with any other version is refused rather than rewritten, so a newer aviary's
+// state is never clobbered by an older one.
+const Version = 1
+
+// FirstPort is where allocation starts. It sits above the ports development
+// stacks conventionally hardcode, so an aviary stack and a hand-started one
+// can coexist on the same machine.
+const FirstPort = 20000
+
+const lastPort = 60000
+
+type Entry struct {
+	Project string `json:"project"`
+	// Root is the worktree directory the stack runs against.
+	Root string `json:"root"`
+	// Config is the external definition directory the stack was loaded
+	// from, or empty when aviary.yml lives in the worktree.
+	Config    string         `json:"config"`
+	Ports     map[string]int `json:"ports"`
+	CreatedAt time.Time      `json:"created_at"`
+	// InitializedAt is set once the stack's init steps have run against
+	// its current volumes, and cleared when the volumes are removed.
+	InitializedAt *time.Time `json:"initialized_at,omitempty"`
+}
+
+type state struct {
+	Version int              `json:"version"`
+	Entries map[string]Entry `json:"entries"`
+}
+
+// Prober reports whether a host port can be handed to a new stack.
+type Prober interface {
+	Free(port int) bool
+}
+
+// ListenProber treats a port as free when aviary can bind it on every
+// interface and on IPv4 and IPv6 loopback. The loopback binds matter on
+// macOS, where a wildcard bind succeeds even while a local dev server holds
+// the port on 127.0.0.1.
+type ListenProber struct{}
+
+func (ListenProber) Free(port int) bool {
+	if !bindable(fmt.Sprintf(":%d", port)) {
+		return false
+	}
+	// A host without IPv6 cannot bind [::1] at all; only an address
+	// already in use counts against a loopback port.
+	for _, addr := range []string{"127.0.0.1", "::1"} {
+		if inUse(net.JoinHostPort(addr, fmt.Sprint(port))) {
+			return false
+		}
+	}
+	return true
+}
+
+func bindable(addr string) bool {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return false
+	}
+	l.Close()
+	return true
+}
+
+func inUse(addr string) bool {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return errors.Is(err, syscall.EADDRINUSE)
+	}
+	l.Close()
+	return false
+}
+
+type Registry struct {
+	path string
+	// Prober checks ports nobody in the registry holds before they are
+	// allocated. Open and OpenAt set it to ListenProber.
+	Prober Prober
+}
+
+// Open locates the registry under the XDG state directory. It is created on
+// first write.
+func Open() (*Registry, error) {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return OpenAt(filepath.Join(dir, "aviary", "registry.json")), nil
+}
+
+func OpenAt(path string) *Registry {
+	return &Registry{path: path, Prober: ListenProber{}}
+}
+
+func (r *Registry) Path() string { return r.path }
+
+// List returns every registered stack ordered by project name. It reads
+// without taking the lock; writes replace the file by rename, so a reader
+// never sees a partial one.
+func (r *Registry) List() ([]Entry, error) {
+	s, err := r.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, 0, len(s.Entries))
+	for _, e := range s.Entries {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Project < out[j].Project })
+	return out, nil
+}
+
+// Allocate returns the entry for project, creating it or extending it so
+// that every name in ports has a host port. Names that already have a port
+// keep it; ports no longer named are released. config is the external
+// definition directory, or empty for an in-tree aviary.yml.
+func (r *Registry) Allocate(project, root, config string, ports []string) (Entry, error) {
+	var entry Entry
+	err := r.update(func(s *state) error {
+		entry = s.Entries[project]
+		if entry.Project == "" {
+			entry = Entry{Project: project, Ports: map[string]int{}, CreatedAt: time.Now().UTC()}
+		}
+		if entry.Ports == nil {
+			entry.Ports = map[string]int{}
+		}
+		entry.Root = root
+		entry.Config = config
+		wanted := map[string]bool{}
+		for _, name := range ports {
+			wanted[name] = true
+		}
+		for name := range entry.Ports {
+			if !wanted[name] {
+				delete(entry.Ports, name)
+			}
+		}
+		// Store the entry before allocating so each new port counts as
+		// taken when the next name is allocated.
+		s.Entries[project] = entry
+		for _, name := range ports {
+			if _, ok := entry.Ports[name]; ok {
+				continue
+			}
+			port, err := r.nextFreePort(s)
+			if err != nil {
+				return err
+			}
+			entry.Ports[name] = port
+		}
+		return nil
+	})
+	return entry, err
+}
+
+// SetInitialized records whether project's init steps have run.
+func (r *Registry) SetInitialized(project string, done bool) error {
+	return r.update(func(s *state) error {
+		entry, ok := s.Entries[project]
+		if !ok {
+			return fmt.Errorf("%s is not registered", project)
+		}
+		if done {
+			now := time.Now().UTC()
+			entry.InitializedAt = &now
+		} else {
+			entry.InitializedAt = nil
+		}
+		s.Entries[project] = entry
+		return nil
+	})
+}
+
+// Release forgets project and frees its ports. Releasing a project that is
+// not registered is a no-op.
+func (r *Registry) Release(project string) error {
+	return r.update(func(s *state) error {
+		delete(s.Entries, project)
+		return nil
+	})
+}
+
+// nextFreePort returns the lowest port from FirstPort that no entry holds
+// and the prober reports free.
+func (r *Registry) nextFreePort(s *state) (int, error) {
+	taken := map[int]bool{}
+	for _, e := range s.Entries {
+		for _, p := range e.Ports {
+			taken[p] = true
+		}
+	}
+	for port := FirstPort; port <= lastPort; port++ {
+		if taken[port] || !r.Prober.Free(port) {
+			continue
+		}
+		return port, nil
+	}
+	return 0, fmt.Errorf("no free port between %d and %d", FirstPort, lastPort)
+}
+
+func (r *Registry) load() (*state, error) {
+	raw, err := os.ReadFile(r.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &state{Version: Version, Entries: map[string]Entry{}}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	s := &state{}
+	if err := json.Unmarshal(raw, s); err != nil {
+		return nil, fmt.Errorf("%s: %w", r.path, err)
+	}
+	if s.Version != Version {
+		return nil, fmt.Errorf("%s: registry version %d is not supported; this aviary reads version %d", r.path, s.Version, Version)
+	}
+	if s.Entries == nil {
+		s.Entries = map[string]Entry{}
+	}
+	return s, nil
+}
+
+// update applies fn to the current state under an exclusive lock on
+// <path>.lock and replaces the file by writing <path>.tmp and renaming it.
+// Nothing is written when fn fails.
+func (r *Registry) update(fn func(*state) error) error {
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
+		return err
+	}
+	lock := flock.New(r.path + ".lock")
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("lock %s: %w", lock.Path(), err)
+	}
+	defer lock.Unlock()
+
+	s, err := r.load()
+	if err != nil {
+		return err
+	}
+	if err := fn(s); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := r.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, r.path)
+}
