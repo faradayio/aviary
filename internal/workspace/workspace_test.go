@@ -219,3 +219,101 @@ func TestDetectThroughASymlinkGivesTheSameRoot(t *testing.T) {
 		t.Errorf("Root = %q, Slug = %q; want the resolved root %q", ws.Root, ws.Slug, root)
 	}
 }
+
+func git(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	base := []string{"-C", dir, "-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"}
+	out, err := exec.Command("git", append(base, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// nestedWorktree makes a parent checkout holding aviary.yml and a worktree of
+// it at .claude/worktrees/x whose branch has no aviary.yml, the layout Claude
+// Code creates by default. It returns the parent and the nested worktree.
+func nestedWorktree(t *testing.T) (string, string) {
+	t.Helper()
+	parent := tempDir(t)
+	gitInit(t, parent, "main")
+	git(t, parent, "commit", "--quiet", "--allow-empty", "-m", "initial")
+	nested := filepath.Join(parent, ".claude", "worktrees", "x")
+	git(t, parent, "worktree", "add", "--quiet", "-b", "x", nested)
+	writeDefinition(t, parent)
+	return parent, nested
+}
+
+func TestDetectInANestedWorktreeIgnoresTheParentDefinition(t *testing.T) {
+	parent, nested := nestedWorktree(t)
+	external := tempDir(t)
+	writeDefinition(t, external)
+
+	ws, err := Detect(nested, external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Root != nested || ws.Definition != external || !ws.External {
+		t.Errorf("Root = %q, Definition = %q, External = %v; want root %q with external %q", ws.Root, ws.Definition, ws.External, nested, external)
+	}
+	parentWs, err := Detect(parent, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Project() == parentWs.Project() {
+		t.Errorf("nested worktree shares the parent's project %q", ws.Project())
+	}
+}
+
+func TestDetectInANestedWorktreeWithoutConfigErrors(t *testing.T) {
+	parent, nested := nestedWorktree(t)
+	sub := mkdir(t, nested, "src")
+
+	ws, err := Detect(sub, "")
+	if err == nil {
+		t.Fatalf("expected an error, got the definition at %q (parent %q)", ws.Definition, parent)
+	}
+	for _, want := range []string{config.FileName, sub, "AVIARY_CONFIG"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestDetectFindsADefinitionAtOrBelowTheGitBoundary(t *testing.T) {
+	repo := tempDir(t)
+	gitInit(t, repo, "main")
+	writeDefinition(t, repo)
+	deep := mkdir(t, repo, "src", "deep")
+
+	ws, err := Detect(deep, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Root != repo {
+		t.Errorf("Root = %q, want the repository root %q holding aviary.yml", ws.Root, repo)
+	}
+
+	sub := mkdir(t, repo, "services")
+	writeDefinition(t, sub)
+	ws, err = Detect(sub, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Root != sub {
+		t.Errorf("Root = %q, want the nearer definition %q", ws.Root, sub)
+	}
+}
+
+func TestDetectTreatsAGitFileAsABoundary(t *testing.T) {
+	parent := tempDir(t)
+	writeDefinition(t, parent)
+	worktree := mkdir(t, parent, "wt")
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /nowhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ws, err := Detect(mkdir(t, worktree, "src"), "")
+	if err == nil {
+		t.Fatalf("walk-up crossed a .git file and found %q", ws.Definition)
+	}
+}

@@ -42,7 +42,8 @@ func (w Workspace) Project() string {
 }
 
 // Detect finds the stack definition for cwd. The nearest aviary.yml in cwd or
-// a parent wins, and its directory is both Root and Definition. Otherwise
+// a parent, up to the enclosing git checkout's top directory, wins, and its
+// directory is both Root and Definition. Otherwise
 // configDir (from --config or AVIARY_CONFIG, empty when neither is set) must
 // hold aviary.yml, and Root is the git toplevel of cwd. Paths are absolute
 // with symlinks resolved, so the same worktree always gets the same slug.
@@ -92,11 +93,18 @@ func canonical(dir string) (string, error) {
 	return filepath.EvalSymlinks(abs)
 }
 
-// findUp returns the nearest directory at or above dir that holds aviary.yml.
+// findUp returns the nearest directory at or above dir that holds aviary.yml,
+// searching no higher than the first directory holding a .git entry (a
+// directory in a main checkout, a file in a linked worktree). Stopping there
+// keeps a worktree nested inside another checkout from adopting that
+// checkout's definition, and with it its root and stack.
 func findUp(dir string) (string, bool) {
 	for {
 		if _, err := os.Stat(filepath.Join(dir, config.FileName)); err == nil {
 			return dir, true
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return "", false
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
