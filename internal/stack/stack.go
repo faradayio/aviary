@@ -37,20 +37,31 @@ type Stack struct {
 	runner func(compose.Stack) Runner
 }
 
-// Load builds the stack for the worktree containing cwd, allocating any host
-// ports it does not have yet. configDir is the external definition directory
-// from --config or AVIARY_CONFIG, or empty when neither is set. Every name in
-// require_env must be set in the host environment; otherwise Load fails
-// listing all the missing names, before touching the registry.
-func Load(cwd, configDir string) (*Stack, error) {
-	reg, err := registry.Open()
-	if err != nil {
-		return nil, err
-	}
-	return load(cwd, configDir, reg)
+// Options adjusts how Load builds a stack.
+type Options struct {
+	// SkipRequireEnv loads the stack without checking require_env, for
+	// commands that never start or run a container and so never hand the
+	// required variables to one.
+	SkipRequireEnv bool
+	// Registry is where ports are allocated. Nil means the machine-wide
+	// registry from registry.Open.
+	Registry *registry.Registry
 }
 
-func load(cwd, configDir string, reg *registry.Registry) (*Stack, error) {
+// Load builds the stack for the worktree containing cwd, allocating any host
+// ports it does not have yet. configDir is the external definition directory
+// from --config or AVIARY_CONFIG, or empty when neither is set. Unless
+// opts.SkipRequireEnv is set, every name in require_env must be set in the
+// host environment; otherwise Load fails listing all the missing names,
+// before touching the registry.
+func Load(cwd, configDir string, opts Options) (*Stack, error) {
+	reg := opts.Registry
+	if reg == nil {
+		var err error
+		if reg, err = registry.Open(); err != nil {
+			return nil, err
+		}
+	}
 	ws, err := workspace.Detect(cwd, configDir)
 	if err != nil {
 		return nil, err
@@ -59,8 +70,10 @@ func load(cwd, configDir string, reg *registry.Registry) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := checkRequiredEnv(cfg.RequireEnv); err != nil {
-		return nil, fmt.Errorf("%s: %w", filepath.Join(ws.Definition, config.FileName), err)
+	if !opts.SkipRequireEnv {
+		if err := checkRequiredEnv(cfg.RequireEnv); err != nil {
+			return nil, fmt.Errorf("%s: %w", filepath.Join(ws.Definition, config.FileName), err)
+		}
 	}
 	s := &Stack{Config: cfg, Workspace: ws, registry: reg, runner: composeRunner}
 	entry, err := reg.Allocate(ws.Project(), ws.Root, s.configSource(), cfg.Ports)
@@ -225,6 +238,16 @@ func (s *Stack) Down(volumes bool) error {
 		return s.markInitialized(false)
 	}
 	return nil
+}
+
+// Remove takes the stack down with its volumes and then forgets it,
+// releasing its host ports. When compose fails the entry is kept, so the
+// stack stays visible to ls and gc.
+func (s *Stack) Remove() error {
+	if err := s.Down(true); err != nil {
+		return err
+	}
+	return s.registry.Release(s.Workspace.Project())
 }
 
 // markInitialized records done in the registry and reloads Entry from it.

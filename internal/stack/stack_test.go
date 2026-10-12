@@ -144,7 +144,7 @@ require_env: [AVIARY_TEST_SET, AVIARY_TEST_MISSING_A, AVIARY_TEST_EMPTY, AVIARY_
 	unset(t, "AVIARY_TEST_MISSING_B")
 	reg := testRegistry(t)
 
-	_, err := load(dir, "", reg)
+	_, err := Load(dir, "", Options{Registry: reg})
 	if err == nil {
 		t.Fatal("expected an error for missing require_env names")
 	}
@@ -166,6 +166,20 @@ require_env: [AVIARY_TEST_SET, AVIARY_TEST_MISSING_A, AVIARY_TEST_EMPTY, AVIARY_
 	}
 }
 
+func TestLoadSkipRequireEnvLoadsWithMissingNames(t *testing.T) {
+	dir := tempDir(t)
+	writeDefinition(t, dir, "compose: {files: [compose.yaml]}\nports: [postgres]\nrequire_env: [AVIARY_TEST_MISSING_A]\n")
+	unset(t, "AVIARY_TEST_MISSING_A")
+
+	s, err := Load(dir, "", Options{Registry: testRegistry(t), SkipRequireEnv: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Entry.Ports["postgres"] != registry.FirstPort {
+		t.Errorf("Ports = %v, want postgres at %d", s.Entry.Ports, registry.FirstPort)
+	}
+}
+
 func TestLoadAllocatesPortsForAnInTreeDefinition(t *testing.T) {
 	root := tempDir(t)
 	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres, redis]\nrequire_env: [AVIARY_TEST_TOKEN]\n")
@@ -175,7 +189,7 @@ func TestLoadAllocatesPortsForAnInTreeDefinition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := load(sub, "", testRegistry(t))
+	s, err := Load(sub, "", Options{Registry: testRegistry(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +213,7 @@ func TestLoadRecordsAnExternalDefinitionInTheRegistry(t *testing.T) {
 	def := tempDir(t)
 	writeDefinition(t, def, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
 
-	s, err := load(repo, def, testRegistry(t))
+	s, err := Load(repo, def, Options{Registry: testRegistry(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,4 +461,30 @@ func TestDownKeepsInitializedUnlessVolumesGo(t *testing.T) {
 	if s.Entry.InitializedAt != nil || entryFor(t, s).InitializedAt != nil {
 		t.Error("down --volumes left the stack marked initialized")
 	}
+}
+
+func TestRemoveTakesVolumesDownThenReleases(t *testing.T) {
+	s, rec := newStack(t, initConfig())
+
+	if err := s.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, rec, argv(nil, "down", "--remove-orphans", "--volumes"))
+	entries, err := s.registry.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("registry has %v after Remove, want no entries", entries)
+	}
+}
+
+func TestRemoveKeepsTheEntryWhenDownFails(t *testing.T) {
+	s, rec := newStack(t, initConfig())
+	rec.fail = func([]string) error { return &compose.ExitError{Code: 1} }
+
+	if err := s.Remove(); err == nil {
+		t.Fatal("expected Remove to fail when compose down fails")
+	}
+	entryFor(t, s)
 }
