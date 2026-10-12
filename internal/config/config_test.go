@@ -226,3 +226,23 @@ func TestLoadAcceptsValidEnvNames(t *testing.T) {
 		t.Errorf("require_env = %v", cfg.RequireEnv)
 	}
 }
+
+// The example the README points at must stay loadable.
+func TestMinimalExampleLoads(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "examples", "minimal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.Ports, []string{"postgres", "redis"}) {
+		t.Errorf("ports = %v", cfg.Ports)
+	}
+	if !reflect.DeepEqual(cfg.Compose.Files, []string{"compose.yaml"}) {
+		t.Errorf("files = %v", cfg.Compose.Files)
+	}
+	if len(cfg.Init) != 1 {
+		t.Errorf("init = %v", cfg.Init)
+	}
+	if !cfg.Suites["db"].WantsInit() || cfg.Suites["smoke"].WantsInit() {
+		t.Errorf("db should want init and smoke should not: %+v", cfg.Suites)
+	}
+}
