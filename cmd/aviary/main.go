@@ -79,16 +79,16 @@ func (a *app) rootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.config, "config", "",
 		"directory holding aviary.yml when the worktree has none (default $AVIARY_CONFIG)")
 	root.AddCommand(
-		a.passthrough("up [--build] [service...]", "Start the stack, or the named services, and wait until healthy", true, "up", "--detach", "--wait"),
+		a.passthrough("up [--build] [service...]", "Start the stack, or the named services, and wait until healthy", startsContainers, "up", "--detach", "--wait"),
 		a.downCmd(),
 		a.testCmd(),
 		a.initCmd(),
-		a.passthrough("run <service> [command...]", "Run a one-off command in a fresh container", true, "run", "--rm"),
-		a.passthrough("exec <service> <command...>", "Run a command in a running container", true, "exec"),
-		a.passthrough("ps", "List this stack's containers", false, "ps"),
-		a.passthrough("logs [service...]", "Show container logs", false, "logs"),
-		a.passthrough("build [service...]", "Build the stack's images", true, "build"),
-		a.passthrough("compose <args...>", "Run any docker compose subcommand against this stack", true),
+		a.passthrough("run <service> [command...]", "Run a one-off command in a fresh container", startsContainers, "run", "--rm"),
+		a.passthrough("exec <service> <command...>", "Run a command in a running container", startsContainers, "exec"),
+		a.passthrough("ps", "List this stack's containers", inspectsOnly, "ps"),
+		a.passthrough("logs [service...]", "Show container logs", inspectsOnly, "logs"),
+		a.passthrough("build [service...]", "Build the stack's images", startsContainers, "build"),
+		a.passthrough("compose <args...>", "Run any docker compose subcommand against this stack", startsContainers),
 		a.envCmd(),
 		a.lsCmd(),
 		a.gcCmd(),
@@ -106,25 +106,34 @@ func (a *app) configDir() string {
 	return os.Getenv("AVIARY_CONFIG")
 }
 
-// loadStack loads the stack for the current directory. checkEnv enforces
-// require_env, which only commands that start or run containers need.
-func (a *app) loadStack(checkEnv bool) (*stack.Stack, error) {
+// How commands load their stack, by what they do with it.
+var (
+	// startsContainers enforces require_env and allocates host ports.
+	startsContainers = stack.Options{}
+	// inspectsOnly is for commands that only look at or stop a stack: they
+	// hand no variables to a container and must not register a stack that
+	// was never started.
+	inspectsOnly = stack.Options{SkipRequireEnv: true, NoAllocate: true}
+)
+
+// loadStack loads the stack for the current directory against the app's
+// registry.
+func (a *app) loadStack(opts stack.Options) (*stack.Stack, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	reg, err := a.openRegistry()
-	if err != nil {
+	if opts.Registry, err = a.openRegistry(); err != nil {
 		return nil, err
 	}
-	return stack.Load(cwd, a.configDir(), stack.Options{Registry: reg, SkipRequireEnv: !checkEnv})
+	return stack.Load(cwd, a.configDir(), opts)
 }
 
 // passthrough makes a command that forwards its arguments to one compose
 // subcommand, after sub and its defaults, with the stack's project, files,
 // profiles and ports applied. An empty sub forwards the arguments as the
 // whole compose command line.
-func (a *app) passthrough(use, short string, checkEnv bool, sub ...string) *cobra.Command {
+func (a *app) passthrough(use, short string, opts stack.Options, sub ...string) *cobra.Command {
 	return &cobra.Command{
 		Use:   use,
 		Short: short,
@@ -134,7 +143,7 @@ Every argument is passed to docker compose unchanged, so aviary flags such as
 --config go before the command name.`,
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := a.loadStack(checkEnv)
+			s, err := a.loadStack(opts)
 			if err != nil {
 				return err
 			}
@@ -150,7 +159,7 @@ func (a *app) downCmd() *cobra.Command {
 		Short: "Stop this stack",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := a.loadStack(false)
+			s, err := a.loadStack(inspectsOnly)
 			if err != nil {
 				return err
 			}
@@ -174,7 +183,7 @@ With no suite, list the suites aviary.yml defines.`,
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Listing suites starts nothing, so it does not need require_env.
-			s, err := a.loadStack(len(args) > 0)
+			s, err := a.loadStack(stack.Options{SkipRequireEnv: len(args) == 0})
 			if err != nil {
 				return err
 			}
@@ -200,7 +209,7 @@ func (a *app) initCmd() *cobra.Command {
 		Short: "Run the stack's init steps if they have not run yet",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := a.loadStack(true)
+			s, err := a.loadStack(startsContainers)
 			if err != nil {
 				return err
 			}
@@ -218,7 +227,9 @@ func (a *app) envCmd() *cobra.Command {
 		Short: "Print this stack's project name, root and host ports",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := a.loadStack(false)
+			// env hands out the ports, so it allocates them, but it starts
+			// nothing and so does not need require_env.
+			s, err := a.loadStack(stack.Options{SkipRequireEnv: true})
 			if err != nil {
 				return err
 			}
@@ -246,8 +257,8 @@ func (a *app) envCmd() *cobra.Command {
 // interface for scripts and agents.
 type stackRow struct {
 	Project string `json:"project"`
-	// Status is compose's status for the project, or "down" when compose
-	// has no containers for it.
+	// Status is compose's status for the project, "down" when compose has
+	// no containers for it, or "unknown" when compose could not be asked.
 	Status          string         `json:"status"`
 	Root            string         `json:"root"`
 	Branch          string         `json:"branch"`
@@ -273,11 +284,16 @@ func (a *app) lsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Docker being down must not hide the registry, which is what
+			// someone cleaning up needs to see.
 			projects, err := a.listProjects()
-			if err != nil {
-				return err
-			}
 			rows := a.rows(entries, projects)
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "aviary: docker compose ls failed: %v; statuses unknown\n", err)
+				for i := range rows {
+					rows[i].Status = "unknown"
+				}
+			}
 			if asJSON {
 				return printJSON(cmd.OutOrStdout(), rows)
 			}
@@ -378,32 +394,36 @@ func (a *app) rmCmd() *cobra.Command {
 		Use:   "rm",
 		Short: "Remove a stack with its volumes and release its ports",
 		Long: `Remove a stack's containers, networks and volumes, and release its host ports.
-Without --project, the stack is this worktree's. A later command in the
-worktree creates the stack again with newly allocated ports.`,
+Without --project, the stack is this worktree's. A later command that starts
+the stack, or aviary env, registers it again with newly allocated ports.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if project == "" {
-				s, err := a.loadStack(false)
+			name := project
+			if name == "" {
+				// Only the project name is needed, so an aviary.yml that
+				// no longer parses does not stop its stack being removed.
+				cwd, err := os.Getwd()
 				if err != nil {
 					return err
 				}
-				if err := s.Remove(); err != nil {
-					return fmt.Errorf("removing %s: %v", s.Workspace.Project(), err)
+				ws, err := workspace.Detect(cwd, a.configDir())
+				if err != nil {
+					return err
 				}
-				return nil
+				name = ws.Project()
 			}
 			reg, err := a.openRegistry()
 			if err != nil {
 				return err
 			}
-			entries, err := reg.List()
+			_, ok, err := reg.Get(name)
 			if err != nil {
 				return err
 			}
-			if !slices.ContainsFunc(entries, func(e registry.Entry) bool { return e.Project == project }) {
-				return fmt.Errorf("no stack %q in the registry; see aviary ls", project)
+			if !ok {
+				return fmt.Errorf("no stack %q in the registry; see aviary ls", name)
 			}
-			return a.remove(reg, project)
+			return a.remove(reg, name)
 		},
 	}
 	cmd.Flags().StringVar(&project, "project", "", "remove this project instead of the current worktree's, even if its worktree is gone")

@@ -299,15 +299,19 @@ func TestSetInitializedRoundTrips(t *testing.T) {
 	if _, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.SetInitialized("aviary-a", true); err != nil {
+	set, err := reg.SetInitialized("aviary-a", true)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if set.InitializedAt == nil || set.Ports["postgres"] != FirstPort || set.Root != "/wt/a" {
+		t.Fatalf("SetInitialized returned %+v, want the whole entry with initialized_at set", set)
 	}
 	entries, err := reg.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entries[0].InitializedAt == nil {
-		t.Fatal("initialized_at should be set")
+	if !reflect.DeepEqual(entries[0], set) {
+		t.Fatalf("stored entry %+v, want the one SetInitialized returned %+v", entries[0], set)
 	}
 
 	// Re-allocating keeps the marker; only SetInitialized(false) clears it.
@@ -319,8 +323,12 @@ func TestSetInitializedRoundTrips(t *testing.T) {
 		t.Error("Allocate should not clear initialized_at")
 	}
 
-	if err := reg.SetInitialized("aviary-a", false); err != nil {
+	cleared, err := reg.SetInitialized("aviary-a", false)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if cleared.InitializedAt != nil {
+		t.Errorf("SetInitialized(false) returned %+v, want initialized_at cleared", cleared)
 	}
 	entries, err = reg.List()
 	if err != nil {
@@ -330,8 +338,44 @@ func TestSetInitializedRoundTrips(t *testing.T) {
 		t.Errorf("initialized_at should be cleared, got %v", entries[0].InitializedAt)
 	}
 
-	if err := reg.SetInitialized("aviary-missing", true); err == nil || !strings.Contains(err.Error(), "aviary-missing") {
+	if _, err := reg.SetInitialized("aviary-missing", true); err == nil || !strings.Contains(err.Error(), "aviary-missing") {
 		t.Errorf("expected an error naming the unregistered project, got %v", err)
+	}
+}
+
+func TestGetReadsOneEntryWithoutWriting(t *testing.T) {
+	reg := open(t)
+	if _, ok, err := reg.Get("aviary-a"); err != nil || ok {
+		t.Fatalf("Get on a missing registry file = ok %v, err %v; want not found", ok, err)
+	}
+	if _, err := os.Stat(reg.Path()); !os.IsNotExist(err) {
+		t.Errorf("Get created %s (stat err %v)", reg.Path(), err)
+	}
+	want, err := reg.Allocate("aviary-a", "/wt/a", "/defs/a", []string{"postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(reg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := reg.Get("aviary-a")
+	if err != nil || !ok {
+		t.Fatalf("Get(aviary-a) = ok %v, err %v; want found", ok, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Get(aviary-a) = %+v, want %+v", got, want)
+	}
+	if _, ok, err := reg.Get("aviary-b"); err != nil || ok {
+		t.Errorf("Get(aviary-b) = ok %v, err %v; want not found", ok, err)
+	}
+	after, err := os.ReadFile(reg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("Get changed the registry file:\n%s\nwas\n%s", after, before)
 	}
 }
 

@@ -29,7 +29,8 @@ type Stack struct {
 	Config    *config.Config
 	Workspace workspace.Workspace
 	// Entry is this stack's registry entry: its host ports and whether its
-	// volumes have been seeded.
+	// volumes have been seeded. It is the zero Entry, with no ports, when
+	// Load ran with NoAllocate for a stack that is not registered.
 	Entry    registry.Entry
 	registry *registry.Registry
 	// runner turns a compose invocation into something that can run it.
@@ -43,13 +44,18 @@ type Options struct {
 	// commands that never start or run a container and so never hand the
 	// required variables to one.
 	SkipRequireEnv bool
+	// NoAllocate reads the stack's registry entry instead of allocating,
+	// for commands that only inspect or stop a stack and so must not
+	// register one. An unregistered stack gets no ports, and its compose
+	// files fall back to their own defaults.
+	NoAllocate bool
 	// Registry is where ports are allocated. Nil means the machine-wide
 	// registry from registry.Open.
 	Registry *registry.Registry
 }
 
 // Load builds the stack for the worktree containing cwd, allocating any host
-// ports it does not have yet. configDir is the external definition directory
+// ports it does not have yet unless opts.NoAllocate is set. configDir is the external definition directory
 // from --config or AVIARY_CONFIG, or empty when neither is set. Unless
 // opts.SkipRequireEnv is set, every name in require_env must be set in the
 // host environment; otherwise Load fails listing all the missing names,
@@ -76,6 +82,14 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 		}
 	}
 	s := &Stack{Config: cfg, Workspace: ws, registry: reg, runner: composeRunner}
+	if opts.NoAllocate {
+		entry, _, err := reg.Get(ws.Project())
+		if err != nil {
+			return nil, err
+		}
+		s.Entry = entry
+		return s, nil
+	}
 	entry, err := reg.Allocate(ws.Project(), ws.Root, s.configSource(), cfg.Ports)
 	if err != nil {
 		return nil, err
@@ -240,7 +254,7 @@ func (s *Stack) SuiteNames() []string {
 }
 
 // Down stops the stack. With volumes, its data goes too and the stack runs
-// init again next time.
+// init again next time. A stack that is not registered stays unregistered.
 func (s *Stack) Down(volumes bool) error {
 	args := []string{"down", "--remove-orphans"}
 	if volumes {
@@ -249,29 +263,15 @@ func (s *Stack) Down(volumes bool) error {
 	if err := s.run(nil, args...); err != nil {
 		return err
 	}
-	if volumes {
+	if volumes && s.Entry.Project != "" {
 		return s.markInitialized(false)
 	}
 	return nil
 }
 
-// Remove takes the stack down with its volumes and then forgets it,
-// releasing its host ports. When compose fails the entry is kept, so the
-// stack stays visible to ls and gc.
-func (s *Stack) Remove() error {
-	if err := s.Down(true); err != nil {
-		return err
-	}
-	return s.registry.Release(s.Workspace.Project())
-}
-
-// markInitialized records done in the registry and reloads Entry from it.
-// Allocate with unchanged ports returns the entry without probing.
+// markInitialized records done in the registry and keeps the updated entry.
 func (s *Stack) markInitialized(done bool) error {
-	if err := s.registry.SetInitialized(s.Workspace.Project(), done); err != nil {
-		return err
-	}
-	entry, err := s.registry.Allocate(s.Workspace.Project(), s.Workspace.Root, s.configSource(), s.Config.Ports)
+	entry, err := s.registry.SetInitialized(s.Workspace.Project(), done)
 	if err != nil {
 		return err
 	}

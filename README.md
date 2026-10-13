@@ -190,8 +190,8 @@ Run from anywhere inside a worktree.
 - `aviary gc [--dry-run]` removes stacks, volumes included, whose worktree
   directory no longer exists, and releases their ports.
 - `aviary rm [--project <name>]` removes this worktree's stack, or the named
-  one, with its volumes, and releases its ports. A later command in the
-  worktree creates the stack again with new ports.
+  one, with its volumes, and releases its ports. A later command that starts
+  the stack, or `aviary env`, registers it again with new ports.
 
 No command prompts. aviary's own errors go to stderr as `aviary: <message>`
 with exit status 1.
@@ -213,7 +213,7 @@ with exit status 1.
 | Key                | Type    | Value                                                                    |
 | ------------------ | ------- | ------------------------------------------------------------------------ |
 | `project`          | string  | compose project name                                                     |
-| `status`           | string  | compose's status, such as `running(3)` or `exited(2)`, or `down` when the stack has no containers |
+| `status`           | string  | compose's status, such as `running(3)` or `exited(2)`, `down` when the stack has no containers, or `unknown` when `docker compose ls` failed |
 | `root`             | string  | worktree root                                                            |
 | `branch`           | string  | current git branch of the root, empty when unknown or detached           |
 | `worktree_missing` | boolean | the root no longer exists; `aviary gc` will remove the stack             |

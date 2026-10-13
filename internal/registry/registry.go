@@ -136,6 +136,17 @@ func (r *Registry) List() ([]Entry, error) {
 	return out, nil
 }
 
+// Get returns project's entry and whether it is registered. Like List, it
+// reads without taking the lock, and it never writes.
+func (r *Registry) Get(project string) (Entry, bool, error) {
+	s, err := r.load()
+	if err != nil {
+		return Entry{}, false, err
+	}
+	entry, ok := s.Entries[project]
+	return entry, ok, nil
+}
+
 // Allocate returns the entry for project, creating it or extending it so
 // that every name in ports has a host port. Names that already have a port
 // keep it; ports no longer named are released. config is the external
@@ -179,10 +190,13 @@ func (r *Registry) Allocate(project, root, config string, ports []string) (Entry
 	return entry, err
 }
 
-// SetInitialized records whether project's init steps have run.
-func (r *Registry) SetInitialized(project string, done bool) error {
-	return r.update(func(s *state) error {
-		entry, ok := s.Entries[project]
+// SetInitialized records whether project's init steps have run and returns
+// the updated entry.
+func (r *Registry) SetInitialized(project string, done bool) (Entry, error) {
+	var entry Entry
+	err := r.update(func(s *state) error {
+		var ok bool
+		entry, ok = s.Entries[project]
 		if !ok {
 			return fmt.Errorf("%s is not registered", project)
 		}
@@ -195,6 +209,10 @@ func (r *Registry) SetInitialized(project string, done bool) error {
 		s.Entries[project] = entry
 		return nil
 	})
+	if err != nil {
+		return Entry{}, err
+	}
+	return entry, nil
 }
 
 // Release forgets project and frees its ports. Releasing a project that is

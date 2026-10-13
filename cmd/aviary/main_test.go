@@ -14,6 +14,7 @@ import (
 	"github.com/faradayio/aviary/internal/compose"
 	"github.com/faradayio/aviary/internal/config"
 	"github.com/faradayio/aviary/internal/registry"
+	"github.com/faradayio/aviary/internal/workspace"
 )
 
 // allFree is a Prober that hands out every port, so tests never bind sockets.
@@ -27,9 +28,12 @@ type harness struct {
 	app      *app
 	reg      *registry.Registry
 	projects []compose.Project
+	listErr  error
 	downed   []string
 	downErr  error
 	composed []composeCall
+	// stderr holds what the last run printed to stderr.
+	stderr bytes.Buffer
 }
 
 type composeCall struct {
@@ -43,7 +47,7 @@ func newHarness(t *testing.T) *harness {
 	h.reg.Prober = allFree{}
 	h.app = &app{
 		openRegistry: func() (*registry.Registry, error) { return h.reg, nil },
-		listProjects: func() ([]compose.Project, error) { return h.projects, nil },
+		listProjects: func() ([]compose.Project, error) { return h.projects, h.listErr },
 		downProject: func(name string) error {
 			h.downed = append(h.downed, name)
 			return h.downErr
@@ -57,13 +61,15 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
-// run executes the CLI with args and returns what it printed to stdout.
+// run executes the CLI with args and returns what it printed to stdout;
+// stderr goes to h.stderr.
 func (h *harness) run(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	cmd := h.app.rootCmd()
 	var out bytes.Buffer
+	h.stderr.Reset()
 	cmd.SetOut(&out)
-	cmd.SetErr(&out)
+	cmd.SetErr(&h.stderr)
 	cmd.SetArgs(args)
 	err := cmd.Execute()
 	return out.String(), err
@@ -140,7 +146,7 @@ func lsFixture(t *testing.T) (h *harness, liveRoot string) {
 	h = newHarness(t)
 	liveRoot = tempDir(t)
 	h.register(t, "aviary-live-111111", liveRoot, "", "postgres", "redis")
-	if err := h.reg.SetInitialized("aviary-live-111111", true); err != nil {
+	if _, err := h.reg.SetInitialized("aviary-live-111111", true); err != nil {
 		t.Fatal(err)
 	}
 	h.register(t, "aviary-gone-222222", "/nonexistent/aviary-test/gone", "/defs/myrepo")
@@ -211,6 +217,39 @@ func TestLsTable(t *testing.T) {
 		if got := strings.Fields(lines[i]); !slices.Equal(got, want) {
 			t.Errorf("line %d = %q, want fields %q", i, lines[i], want)
 		}
+	}
+}
+
+func TestLsReportsUnknownStatusWhenComposeLsFails(t *testing.T) {
+	h, _ := lsFixture(t)
+	h.listErr = errors.New("cannot connect to the Docker daemon")
+	warning := "aviary: docker compose ls failed: cannot connect to the Docker daemon; statuses unknown\n"
+
+	out, err := h.run(t, "ls", "--json")
+	if err != nil {
+		t.Fatalf("ls --json failed with compose ls down: %v", err)
+	}
+	var rows []stackRow
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("ls --json is not a JSON array: %v\n%s", err, out)
+	}
+	if len(rows) != 2 || rows[0].Status != "unknown" || rows[1].Status != "unknown" {
+		t.Errorf("ls --json rows = %+v, want both with status unknown", rows)
+	}
+	if got := h.stderr.String(); got != warning {
+		t.Errorf("ls --json stderr = %q, want %q", got, warning)
+	}
+
+	out, err = h.run(t, "ls")
+	if err != nil {
+		t.Fatalf("ls failed with compose ls down: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 || strings.Fields(lines[1])[1] != "unknown" || strings.Fields(lines[2])[1] != "unknown" {
+		t.Errorf("ls table with compose ls down =\n%s\nwant both rows with status unknown", out)
+	}
+	if got := h.stderr.String(); got != warning {
+		t.Errorf("ls stderr = %q, want %q", got, warning)
 	}
 }
 
@@ -286,6 +325,80 @@ func TestRmUnknownProjectFails(t *testing.T) {
 	}
 	if len(h.downed) != 0 {
 		t.Errorf("rm of an unknown project took down %v", h.downed)
+	}
+}
+
+func TestRmWithoutProjectRemovesThisWorktreesStackByLabel(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
+	t.Chdir(root)
+	h := newHarness(t)
+	project := envJSON(t, h, "env", "--json")["AVIARY_PROJECT"]
+	h.register(t, "aviary-other-333333", "/wt/other", "", "postgres")
+	// rm needs only to find aviary.yml, not to parse it.
+	writeDefinition(t, root, "not: [valid")
+
+	if _, err := h.run(t, "rm"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(h.downed, []string{project}) {
+		t.Errorf("rm took down %v by label, want [%s]", h.downed, project)
+	}
+	if len(h.composed) != 0 {
+		t.Errorf("rm ran compose through the stack's files: %v", h.composed)
+	}
+	if got := h.projectNames(t); !slices.Equal(got, []string{"aviary-other-333333"}) {
+		t.Errorf("registry after rm = %v, want only the other stack", got)
+	}
+}
+
+func TestRmWithoutProjectFailsForAnUnregisteredWorktree(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\n")
+	t.Chdir(root)
+	h := newHarness(t)
+
+	_, err := h.run(t, "rm")
+	if err == nil || !strings.Contains(err.Error(), workspace.ProjectPrefix+workspace.Slug(root)) {
+		t.Fatalf("rm in an unregistered worktree: error = %v, want one naming its project", err)
+	}
+	if len(h.downed) != 0 {
+		t.Errorf("rm of an unregistered worktree took down %v", h.downed)
+	}
+}
+
+func TestInspectingCommandsDoNotRegisterTheStack(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
+	t.Chdir(root)
+	h := newHarness(t)
+
+	for _, args := range [][]string{{"ps"}, {"logs", "app"}, {"down"}, {"down", "--volumes"}} {
+		if _, err := h.run(t, args...); err != nil {
+			t.Fatalf("aviary %s: %v", strings.Join(args, " "), err)
+		}
+		if _, err := os.Stat(h.reg.Path()); !os.IsNotExist(err) {
+			t.Fatalf("aviary %s wrote the registry (stat err %v)", strings.Join(args, " "), err)
+		}
+	}
+	if len(h.composed) != 2 {
+		t.Fatalf("compose calls = %v, want ps and logs through the passthrough", h.composed)
+	}
+	if port, ok := h.composed[0].stack.Env["AVIARY_PORT_POSTGRES"]; ok {
+		t.Errorf("ps on an unregistered stack set AVIARY_PORT_POSTGRES=%s, want it unset", port)
+	}
+
+	if _, err := h.run(t, "up"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.projectNames(t); len(got) != 1 {
+		t.Fatalf("registry after up = %v, want the stack registered", got)
+	}
+	if _, err := h.run(t, "ps"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.composed[len(h.composed)-1].stack.Env["AVIARY_PORT_POSTGRES"]; got != "20000" {
+		t.Errorf("ps on a registered stack set AVIARY_PORT_POSTGRES=%q, want the registered 20000", got)
 	}
 }
 

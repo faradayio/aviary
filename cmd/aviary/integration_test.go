@@ -75,6 +75,22 @@ func TestMinimalExampleEndToEnd(t *testing.T) {
 		return out
 	}
 
+	regPath := filepath.Join(stateHome, "aviary", "registry.json")
+	registered := func(t *testing.T) []registry.Entry {
+		t.Helper()
+		entries, err := registry.OpenAt(regPath).List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+
+	// Looking at a never-started stack must not register it.
+	mustRun(t, "ps")
+	if entries := registered(t); len(entries) != 0 {
+		t.Fatalf("registry after ps on a never-started stack = %+v, want empty", entries)
+	}
+
 	var envOut map[string]string
 	if err := json.Unmarshal([]byte(mustRun(t, "env", "--json")), &envOut); err != nil {
 		t.Fatal(err)
@@ -140,11 +156,7 @@ func TestMinimalExampleEndToEnd(t *testing.T) {
 	mustRun(t, "down", "--volumes")
 	mustRun(t, "rm")
 
-	entries, err := registry.OpenAt(filepath.Join(stateHome, "aviary", "registry.json")).List()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
+	if entries := registered(t); len(entries) != 0 {
 		t.Errorf("registry after rm = %+v, want empty", entries)
 	}
 	if after := files(t, worktree); !slices.Equal(before, after) {

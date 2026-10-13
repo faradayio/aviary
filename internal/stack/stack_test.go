@@ -1,10 +1,13 @@
 package stack
 
 import (
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -226,6 +229,79 @@ func TestLoadRecordsAnExternalDefinitionInTheRegistry(t *testing.T) {
 	}
 }
 
+func TestLoadNoAllocateLeavesAnUnregisteredStackUnregistered(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
+	reg := testRegistry(t)
+
+	s, err := Load(root, "", Options{Registry: reg, NoAllocate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Entry.Ports) != 0 {
+		t.Errorf("Ports = %v, want none for a stack that was never registered", s.Entry.Ports)
+	}
+	if _, ok := s.Env()["AVIARY_PORT_POSTGRES"]; ok {
+		t.Errorf("Env = %v, want no port variables so compose falls back to its defaults", s.Env())
+	}
+	if _, err := os.Stat(reg.Path()); !os.IsNotExist(err) {
+		t.Errorf("Load with NoAllocate wrote %s (stat err %v)", reg.Path(), err)
+	}
+}
+
+func TestLoadNoAllocateUsesTheRegisteredPortsWithoutWriting(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
+	reg := testRegistry(t)
+	if _, err := Load(root, "", Options{Registry: reg}); err != nil {
+		t.Fatal(err)
+	}
+	// A port name added since registration would be allocated by a plain
+	// Load; NoAllocate must leave the registry as it is.
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres, redis]\n")
+	before, err := os.ReadFile(reg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Load(root, "", Options{Registry: reg, NoAllocate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]int{"postgres": registry.FirstPort}; !maps.Equal(s.Entry.Ports, want) {
+		t.Errorf("Ports = %v, want the registered %v", s.Entry.Ports, want)
+	}
+	after, err := os.ReadFile(reg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("Load with NoAllocate changed the registry:\n%s\nwas\n%s", after, before)
+	}
+}
+
+func TestDownVolumesOnAnUnregisteredStackDoesNotRegisterIt(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
+	reg := testRegistry(t)
+	s, err := Load(root, "", Options{Registry: reg, NoAllocate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{}
+	s.runner = func(c compose.Stack) Runner { return recordingRunner{rec, c} }
+
+	if err := s.Down(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("Down made %d compose calls, want 1", len(rec.calls))
+	}
+	if _, err := os.Stat(reg.Path()); !os.IsNotExist(err) {
+		t.Errorf("Down --volumes on an unregistered stack wrote %s (stat err %v)", reg.Path(), err)
+	}
+}
+
 func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 	s, _ := newStack(t, &config.Config{
 		Compose: config.Compose{Files: []string{"compose.yaml"}},
@@ -326,6 +402,44 @@ func TestInitRunsStepsInOrderThenMarksInitialized(t *testing.T) {
 	}
 	if len(rec.calls) != 3 {
 		t.Errorf("Init(true) made %d compose calls, want the 3 steps again", len(rec.calls))
+	}
+}
+
+func TestInitWritesTheRegistryOnceAfterTheSteps(t *testing.T) {
+	s, rec := newStack(t, initConfig())
+	before := entryFor(t, s)
+	raw, err := os.ReadFile(s.registry.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.fail = func([]string) error {
+		if now, err := os.ReadFile(s.registry.Path()); err != nil || string(now) != string(raw) {
+			t.Errorf("registry changed while an init step ran (err %v)", err)
+		}
+		return nil
+	}
+
+	if err := s.Init(false); err != nil {
+		t.Fatal(err)
+	}
+	after := entryFor(t, s)
+	if after.InitializedAt == nil {
+		t.Fatal("initialized_at not set after init")
+	}
+	if !after.CreatedAt.Equal(before.CreatedAt) || !maps.Equal(after.Ports, before.Ports) || after.Root != before.Root {
+		t.Errorf("entry after init = %+v, want %+v with only initialized_at added", after, before)
+	}
+	var file struct {
+		Version int `json:"version"`
+	}
+	if raw, err = os.ReadFile(s.registry.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &file); err != nil || file.Version != registry.Version {
+		t.Errorf("registry version after init = %d (err %v), want %d", file.Version, err, registry.Version)
+	}
+	if !reflect.DeepEqual(s.Entry, after) {
+		t.Errorf("Stack.Entry = %+v, want the stored entry %+v", s.Entry, after)
 	}
 }
 
@@ -491,30 +605,4 @@ func TestDownKeepsInitializedUnlessVolumesGo(t *testing.T) {
 	if s.Entry.InitializedAt != nil || entryFor(t, s).InitializedAt != nil {
 		t.Error("down --volumes left the stack marked initialized")
 	}
-}
-
-func TestRemoveTakesVolumesDownThenReleases(t *testing.T) {
-	s, rec := newStack(t, initConfig())
-
-	if err := s.Remove(); err != nil {
-		t.Fatal(err)
-	}
-	assertCalls(t, rec, argv(nil, "down", "--remove-orphans", "--volumes"))
-	entries, err := s.registry.List()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("registry has %v after Remove, want no entries", entries)
-	}
-}
-
-func TestRemoveKeepsTheEntryWhenDownFails(t *testing.T) {
-	s, rec := newStack(t, initConfig())
-	rec.fail = func([]string) error { return &compose.ExitError{Code: 1} }
-
-	if err := s.Remove(); err == nil {
-		t.Fatal("expected Remove to fail when compose down fails")
-	}
-	entryFor(t, s)
 }
