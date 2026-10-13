@@ -55,11 +55,11 @@ type Options struct {
 }
 
 // Load builds the stack for the worktree containing cwd, allocating any host
-// ports it does not have yet unless opts.NoAllocate is set. configDir is the external definition directory
-// from --config or AVIARY_CONFIG, or empty when neither is set. Unless
-// opts.SkipRequireEnv is set, every name in require_env must be set in the
-// host environment; otherwise Load fails listing all the missing names,
-// before touching the registry.
+// ports it does not have yet unless opts.NoAllocate is set. configDir is the
+// external definition directory from --config or AVIARY_CONFIG, or empty when
+// neither is set. Unless opts.SkipRequireEnv is set, every name in
+// require_env must be set in the host environment; otherwise Load fails
+// listing all the missing names, before touching the registry.
 func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	reg := opts.Registry
 	if reg == nil {
