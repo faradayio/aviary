@@ -272,7 +272,7 @@ func TestDetectInANestedWorktreeWithoutConfigErrors(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected an error, got the definition at %q (parent %q)", ws.Definition, parent)
 	}
-	for _, want := range []string{config.FileName, sub, "AVIARY_CONFIG"} {
+	for _, want := range []string{config.FileName, sub, "up to the checkout top " + nested, "AVIARY_CONFIG"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
