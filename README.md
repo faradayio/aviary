@@ -68,8 +68,8 @@ compose, so the compose files can interpolate them.
 
 aviary finds the stack definition in one of two places, in this order:
 
-1. **In-tree.** The nearest `aviary.yml` in the current directory or a parent.
-   That directory is the worktree root.
+1. **In-tree.** The nearest `aviary.yml` in the current directory or a parent,
+   within the current checkout. That directory is the worktree root.
 2. **External.** When there is no in-tree file, the directory named by
    `--config <dir>` or, failing that, `AVIARY_CONFIG`. The worktree root is
    then `git rev-parse --show-toplevel` of the current directory.
@@ -124,10 +124,14 @@ Arguments after `--` are appended to the suite's command, so
 `aviary test api -- --grep users` reaches the test runner. aviary exits with
 the suite's own status. A suite with `init: false` skips step 1.
 
-Init runs once per set of volumes. A failing step stops the sequence, names
-the step, and leaves the stack uninitialized with the partial data kept for
-inspection. `aviary down --volumes` discards the data so init runs again next
-time; `aviary init --force` reruns the steps against the current data.
+Init runs once per stack. A failing step stops the sequence, names the step,
+and leaves the stack uninitialized with the partial data kept for inspection.
+`aviary down --volumes` and `aviary rm` discard the data so init runs again
+next time; `aviary init --force` reruns the steps against the current data.
+aviary records that init has run rather than checking the volumes, so removing
+them any other way, such as `aviary compose down -v`, leaves the stack marked
+initialized until `aviary init --force`. Checking that the volumes exist
+arrives with seeded snapshots.
 
 `aviary test` with no suite lists the suites. Because everything after the
 suite name belongs to the suite, `aviary test --help` is read as a suite
