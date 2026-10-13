@@ -369,13 +369,18 @@ func TestRmWithoutProjectFailsForAnUnregisteredWorktree(t *testing.T) {
 
 func TestInspectingCommandsDoNotRegisterTheStack(t *testing.T) {
 	root := tempDir(t)
-	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
+	writeDefinition(t, root, `
+compose: {files: [compose.yaml]}
+ports: [postgres]
+suites:
+  unit: {service: app, command: [true]}
+`)
 	t.Chdir(root)
 	h := newHarness(t)
 
 	// down is left out: its compose call is not behind the app seam, so it
 	// would run docker. The stack tests cover Down on an unregistered stack.
-	for _, args := range [][]string{{"ps"}, {"logs", "app"}} {
+	for _, args := range [][]string{{"ps"}, {"logs", "app"}, {"test"}} {
 		if _, err := h.run(t, args...); err != nil {
 			t.Fatalf("aviary %s: %v", strings.Join(args, " "), err)
 		}

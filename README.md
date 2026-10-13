@@ -116,7 +116,7 @@ suites:
 `aviary test api`:
 
 1. runs the init steps, each as `docker compose run --rm <service> <command>`,
-   if this stack's volumes have not been initialized yet;
+   if init has not run for this stack yet;
 2. starts `postgres` and `redis` and waits until they are healthy;
 3. runs `npm test` in a fresh `api` container.
 

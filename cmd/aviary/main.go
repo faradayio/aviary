@@ -182,8 +182,13 @@ with any extra args appended. The exit status is the suite's own.
 With no suite, list the suites aviary.yml defines.`,
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Listing suites starts nothing, so it does not need require_env.
-			s, err := a.loadStack(stack.Options{SkipRequireEnv: len(args) == 0})
+			// Listing suites starts nothing, so it neither needs require_env
+			// nor registers the stack.
+			opts := startsContainers
+			if len(args) == 0 {
+				opts = inspectsOnly
+			}
+			s, err := a.loadStack(opts)
 			if err != nil {
 				return err
 			}

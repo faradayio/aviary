@@ -28,9 +28,10 @@ type Runner interface {
 type Stack struct {
 	Config    *config.Config
 	Workspace workspace.Workspace
-	// Entry is this stack's registry entry: its host ports and whether its
-	// volumes have been seeded. It is the zero Entry, with no ports, when
-	// Load ran with NoAllocate for a stack that is not registered.
+	// Entry is this stack's registry entry: its host ports and whether
+	// aviary has recorded that its init steps ran. It is the zero Entry,
+	// with no ports, when Load ran with NoAllocate for a stack that is not
+	// registered.
 	Entry    registry.Entry
 	registry *registry.Registry
 	// runner turns a compose invocation into something that can run it.
