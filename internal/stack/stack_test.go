@@ -229,17 +229,17 @@ func TestLoadRecordsAnExternalDefinitionInTheRegistry(t *testing.T) {
 func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 	s, _ := newStack(t, &config.Config{
 		Compose: config.Compose{Files: []string{"compose.yaml"}},
-		Ports:   []string{"postgres", "redis", "nick_https"},
+		Ports:   []string{"postgres", "redis", "web_https"},
 	})
 	env := s.Env()
 	want := map[string]string{
-		"COMPOSE_PROJECT_NAME":   "aviary-wt-abc123",
-		"AVIARY_PROJECT":         "aviary-wt-abc123",
-		"AVIARY_SLUG":            "wt-abc123",
-		"AVIARY_ROOT":            "/work/wt",
-		"AVIARY_PORT_POSTGRES":   "20000",
-		"AVIARY_PORT_REDIS":      "20001",
-		"AVIARY_PORT_NICK_HTTPS": "20002",
+		"COMPOSE_PROJECT_NAME":  "aviary-wt-abc123",
+		"AVIARY_PROJECT":        "aviary-wt-abc123",
+		"AVIARY_SLUG":           "wt-abc123",
+		"AVIARY_ROOT":           "/work/wt",
+		"AVIARY_PORT_POSTGRES":  "20000",
+		"AVIARY_PORT_REDIS":     "20001",
+		"AVIARY_PORT_WEB_HTTPS": "20002",
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -253,7 +253,7 @@ func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 	if !slices.IsSorted(lines) || !slices.Contains(lines, "AVIARY_PORT_REDIS=20001") {
 		t.Errorf("EnvLines = %q, want sorted KEY=VALUE lines", lines)
 	}
-	if c := s.Compose(); c.Env["AVIARY_PORT_NICK_HTTPS"] != "20002" {
+	if c := s.Compose(); c.Env["AVIARY_PORT_WEB_HTTPS"] != "20002" {
 		t.Errorf("Compose().Env = %v, want the stack's Env", c.Env)
 	}
 }
@@ -263,9 +263,9 @@ func initConfig() *config.Config {
 		Compose: config.Compose{Files: []string{"compose.yaml"}},
 		Ports:   []string{"postgres"},
 		Init: []config.Step{
-			{Service: "diamond", Command: []string{"rake", "db:reset"}},
-			{Service: "vannevar", Command: []string{"bin/vannevar", "seed"}},
-			{Service: "diamond", Command: []string{"psql", "-f", "billing.sql"}},
+			{Service: "api", Command: []string{"rake", "db:reset"}},
+			{Service: "worker", Command: []string{"bin/worker", "seed"}},
+			{Service: "api", Command: []string{"psql", "-f", "reference.sql"}},
 		},
 	}
 }
@@ -277,9 +277,9 @@ func TestInitRunsStepsInOrderThenMarksInitialized(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCalls(t, rec,
-		argv(nil, "run", "--rm", "diamond", "rake", "db:reset"),
-		argv(nil, "run", "--rm", "vannevar", "bin/vannevar", "seed"),
-		argv(nil, "run", "--rm", "diamond", "psql", "-f", "billing.sql"),
+		argv(nil, "run", "--rm", "api", "rake", "db:reset"),
+		argv(nil, "run", "--rm", "worker", "bin/worker", "seed"),
+		argv(nil, "run", "--rm", "api", "psql", "-f", "reference.sql"),
 	)
 	if s.Entry.InitializedAt == nil || entryFor(t, s).InitializedAt == nil {
 		t.Fatal("stack not marked initialized after init")
@@ -302,7 +302,7 @@ func TestInitRunsStepsInOrderThenMarksInitialized(t *testing.T) {
 func TestInitStopsAtTheFailingStepAndStaysUninitialized(t *testing.T) {
 	s, rec := newStack(t, initConfig())
 	rec.fail = func(args []string) error {
-		if slices.Contains(args, "vannevar") {
+		if slices.Contains(args, "worker") {
 			return &compose.ExitError{Code: 2}
 		}
 		return nil
@@ -315,7 +315,7 @@ func TestInitStopsAtTheFailingStepAndStaysUninitialized(t *testing.T) {
 	if len(rec.calls) != 2 {
 		t.Errorf("made %d compose calls, want 2: steps after the failure must not run", len(rec.calls))
 	}
-	if !strings.Contains(err.Error(), "init step 2 (vannevar bin/vannevar seed)") {
+	if !strings.Contains(err.Error(), "init step 2 (worker bin/worker seed)") {
 		t.Errorf("error %q does not name the failing step", err)
 	}
 	var exit *compose.ExitError
@@ -333,15 +333,15 @@ func suiteConfig() *config.Config {
 	cfg.Compose.Profiles = []string{"dev"}
 	noInit := false
 	cfg.Suites = map[string]config.Suite{
-		"sojourner": {Service: "sojourner", Needs: []string{"postgres", "redis"}, Command: []string{"pnpm", "run", "test:ci"}},
+		"web": {Service: "web", Needs: []string{"postgres", "redis"}, Command: []string{"pnpm", "run", "test:ci"}},
 		"acceptance": {
 			Service:  "acceptance",
 			Profiles: []string{"acceptance"},
-			Needs:    []string{"nick"},
+			Needs:    []string{"proxy"},
 			Command:  []string{"pnpm", "test"},
 			Init:     &noInit,
 		},
-		"popsicle": {Service: "popsicle", Command: []string{"pnpm", "run", "test:ci"}, Init: &noInit},
+		"frontend": {Service: "frontend", Command: []string{"pnpm", "run", "test:ci"}, Init: &noInit},
 	}
 	return cfg
 }
@@ -349,13 +349,13 @@ func suiteConfig() *config.Config {
 func TestTestRunsInitThenNeedsThenTheSuite(t *testing.T) {
 	s, rec := newStack(t, suiteConfig())
 
-	if err := s.Test("sojourner", []string{"--", "--grep", "users"}); err != nil {
+	if err := s.Test("web", []string{"--", "--grep", "users"}); err != nil {
 		t.Fatal(err)
 	}
 	assertCalls(t, rec,
-		argv([]string{"dev"}, "run", "--rm", "diamond", "rake", "db:reset"),
+		argv([]string{"dev"}, "run", "--rm", "api", "rake", "db:reset"),
 		argv([]string{"dev"}, "up", "--detach", "--wait", "postgres", "redis"),
-		argv([]string{"dev"}, "run", "--rm", "sojourner", "pnpm", "run", "test:ci", "--grep", "users"),
+		argv([]string{"dev"}, "run", "--rm", "web", "pnpm", "run", "test:ci", "--grep", "users"),
 	)
 	if entryFor(t, s).InitializedAt == nil {
 		t.Error("stack not marked initialized by a suite that wants init")
@@ -370,7 +370,7 @@ func TestTestPassesStackAndSuiteProfilesAndSkipsInitWhenTheSuiteSaysSo(t *testin
 	}
 	profiles := []string{"dev", "acceptance"}
 	assertCalls(t, rec,
-		argv(profiles, "up", "--detach", "--wait", "nick"),
+		argv(profiles, "up", "--detach", "--wait", "proxy"),
 		argv(profiles, "run", "--rm", "acceptance", "pnpm", "test", "spec/login.ts"),
 	)
 	if entryFor(t, s).InitializedAt != nil {
@@ -384,22 +384,22 @@ func TestTestPassesStackAndSuiteProfilesAndSkipsInitWhenTheSuiteSaysSo(t *testin
 func TestTestWithoutNeedsOnlyRunsTheSuite(t *testing.T) {
 	s, rec := newStack(t, suiteConfig())
 
-	if err := s.Test("popsicle", nil); err != nil {
+	if err := s.Test("frontend", nil); err != nil {
 		t.Fatal(err)
 	}
-	assertCalls(t, rec, argv([]string{"dev"}, "run", "--rm", "popsicle", "pnpm", "run", "test:ci"))
+	assertCalls(t, rec, argv([]string{"dev"}, "run", "--rm", "frontend", "pnpm", "run", "test:ci"))
 }
 
 func TestTestPropagatesTheSuiteExitCode(t *testing.T) {
 	s, rec := newStack(t, suiteConfig())
 	rec.fail = func(args []string) error {
-		if slices.Contains(args, "popsicle") {
+		if slices.Contains(args, "frontend") {
 			return &compose.ExitError{Code: 3}
 		}
 		return nil
 	}
 
-	err := s.Test("popsicle", nil)
+	err := s.Test("frontend", nil)
 	var exit *compose.ExitError
 	if !errors.As(err, &exit) || exit.Code != 3 {
 		t.Fatalf("Test error = %v, want *compose.ExitError with code 3", err)
@@ -416,7 +416,7 @@ func TestTestFailingNeedsIsAviarysOwnError(t *testing.T) {
 	}
 
 	err := s.Test("acceptance", nil)
-	if err == nil || !strings.Contains(err.Error(), "nick") || !strings.Contains(err.Error(), "acceptance") {
+	if err == nil || !strings.Contains(err.Error(), "proxy") || !strings.Contains(err.Error(), "acceptance") {
 		t.Fatalf("Test error = %v, want one naming the needs and the suite", err)
 	}
 	var exit *compose.ExitError
@@ -432,7 +432,7 @@ func TestTestUnknownSuiteListsTheSuites(t *testing.T) {
 	s, rec := newStack(t, suiteConfig())
 
 	err := s.Test("nope", nil)
-	if err == nil || !strings.Contains(err.Error(), "acceptance, popsicle, sojourner") {
+	if err == nil || !strings.Contains(err.Error(), "acceptance, frontend, web") {
 		t.Fatalf("Test error = %v, want the sorted suite names", err)
 	}
 	assertCalls(t, rec)

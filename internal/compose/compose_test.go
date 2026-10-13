@@ -12,7 +12,7 @@ func TestArgsPinsProjectDirectoryAndFiles(t *testing.T) {
 	s := Stack{
 		Project:    "aviary-wt-abc123",
 		Root:       "/work/wt",
-		Definition: "/defs/fdy",
+		Definition: "/defs/myrepo",
 		Files:      []string{"compose.yaml", "/abs/compose.dev.yaml"},
 	}
 	got := s.Args("up", "--detach", "--wait", "postgres")
@@ -20,7 +20,7 @@ func TestArgsPinsProjectDirectoryAndFiles(t *testing.T) {
 		"compose",
 		"--project-name", "aviary-wt-abc123",
 		"--project-directory", "/work/wt",
-		"--file", "/defs/fdy/compose.yaml",
+		"--file", "/defs/myrepo/compose.yaml",
 		"--file", "/abs/compose.dev.yaml",
 		"up", "--detach", "--wait", "postgres",
 	}
@@ -30,9 +30,9 @@ func TestArgsPinsProjectDirectoryAndFiles(t *testing.T) {
 }
 
 func TestArgsResolvesFilesAgainstDefinitionNotRoot(t *testing.T) {
-	s := Stack{Project: "p", Root: "/work/wt", Definition: "/defs/fdy", Files: []string{"sub/../compose.yaml"}}
+	s := Stack{Project: "p", Root: "/work/wt", Definition: "/defs/myrepo", Files: []string{"sub/../compose.yaml"}}
 	got := s.Args("ps")
-	if !slices.Contains(got, "/defs/fdy/compose.yaml") {
+	if !slices.Contains(got, "/defs/myrepo/compose.yaml") {
 		t.Fatalf("Args %q: want file resolved under the definition dir", got)
 	}
 	if slices.Contains(got, "/work/wt/compose.yaml") {
@@ -160,7 +160,7 @@ func TestParseResolved(t *testing.T) {
 	}
 	// Two services mount postgres; the bind mount and the other volume do
 	// not count, and the result is sorted regardless of map order.
-	want := []string{"diamond:latest", "postgis/postgis:17-3.5"}
+	want := []string{"api:latest", "postgis/postgis:17-3.5"}
 	if got := r.ImagesMounting("postgres"); !slices.Equal(got, want) {
 		t.Fatalf("ImagesMounting(postgres) = %q, want %q", got, want)
 	}

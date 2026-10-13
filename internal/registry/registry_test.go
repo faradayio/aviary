@@ -147,7 +147,7 @@ func (allBusy) Free(int) bool { return false }
 
 func TestAllocatePersistsRootAndConfig(t *testing.T) {
 	reg := open(t)
-	if _, err := reg.Allocate("aviary-a", "/wt/a", "/defs/fdy", []string{"postgres"}); err != nil {
+	if _, err := reg.Allocate("aviary-a", "/wt/a", "/defs/myrepo", []string{"postgres"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.Allocate("aviary-b", "/wt/b", "", nil); err != nil {
@@ -161,7 +161,7 @@ func TestAllocatePersistsRootAndConfig(t *testing.T) {
 		t.Fatalf("expected 2 entries, got %v", entries)
 	}
 	a, b := entries[0], entries[1]
-	if a.Project != "aviary-a" || a.Root != "/wt/a" || a.Config != "/defs/fdy" {
+	if a.Project != "aviary-a" || a.Root != "/wt/a" || a.Config != "/defs/myrepo" {
 		t.Errorf("aviary-a = %+v", a)
 	}
 	if b.Project != "aviary-b" || b.Root != "/wt/b" || b.Config != "" {
@@ -183,7 +183,7 @@ func TestAllocatePersistsRootAndConfig(t *testing.T) {
 
 func TestFileCarriesVersionAndEntryKeys(t *testing.T) {
 	reg := open(t)
-	if _, err := reg.Allocate("aviary-a", "/wt/a", "/defs/fdy", []string{"postgres"}); err != nil {
+	if _, err := reg.Allocate("aviary-a", "/wt/a", "/defs/myrepo", []string{"postgres"}); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(reg.Path())

@@ -19,31 +19,31 @@ func write(t *testing.T, body string) string {
 	return dir
 }
 
-// fullExample is the v1 schema example from the design, covering every key.
+// fullExample is a v1 schema example covering every key.
 const fullExample = `compose:
   files: [compose.yaml, compose.dev.yaml]   # relative to this file
   profiles: []                              # optional, passed as --profile
-ports: [postgres, redis, nick_https]        # names -> AVIARY_PORT_<NAME>
+ports: [postgres, redis, web_https]         # names -> AVIARY_PORT_<NAME>
 require_env: [VAULT_TOKEN]                  # fail early with a clear message
 init:                                       # seed from scratch, once per key
-  - {service: diamond, command: [rake, db:reset]}
-  - {service: diamond, command: [psql, -f, db/billing_setup.sql]}
-  - {service: vannevar, command: [bin/vannevar, seed]}
+  - {service: api, command: [rake, db:reset]}
+  - {service: api, command: [psql, -f, db/reference_data.sql]}
+  - {service: worker, command: [bin/worker, seed]}
 after_restore:                              # bring a restored volume current
-  - {service: diamond, command: [rake, db:migrate]}
+  - {service: api, command: [rake, db:migrate]}
 suites:
-  sojourner:  {service: sojourner, needs: [postgres, redis], command: [pnpm, run, test:ci]}
-  popsicle:   {service: popsicle, command: [pnpm, run, test:ci], init: false}
+  web:        {service: web, needs: [postgres, redis], command: [pnpm, run, test:ci]}
+  frontend:   {service: frontend, command: [pnpm, run, test:ci], init: false}
   acceptance: {service: acceptance, profiles: [acceptance],
-               needs: [nick, popsicle, kopeng, sojourner, extapiweb, gaia, chief, adminweb],
+               needs: [proxy, frontend, worker, web, api, admin, scheduler, search],
                command: [pnpm, test]}
-  model-train: {service: model_train, profiles: [model-train], needs: [postgres],
-               command: [./cage_run_tests]}
-  diamond-empty: {service: diamond, needs: [redis], command: [rake, test], init: false}
+  ml-train:   {service: ml_trainer, profiles: [ml-train], needs: [postgres],
+               command: [./run_tests.sh]}
+  api-empty:  {service: api, needs: [redis], command: [rake, test], init: false}
 snapshot:
   volumes: [postgres]
-  key_files: [src/vannevar/seeds/, src/diamond/db/billing_setup.sql]   # seed inputs
-  stamp_files: [src/diamond/db/structure.sql]                           # schema
+  key_files: [src/worker/seeds/, src/api/db/reference_data.sql]   # seed inputs
+  stamp_files: [src/api/db/schema.sql]                             # schema
 `
 
 func TestLoadReadsFilesAndPorts(t *testing.T) {
@@ -67,25 +67,25 @@ func TestLoadReadsTheFullSchema(t *testing.T) {
 	if !reflect.DeepEqual(cfg.RequireEnv, []string{"VAULT_TOKEN"}) {
 		t.Errorf("require_env = %v", cfg.RequireEnv)
 	}
-	if len(cfg.Init) != 3 || cfg.Init[2].Service != "vannevar" {
+	if len(cfg.Init) != 3 || cfg.Init[2].Service != "worker" {
 		t.Errorf("init = %+v", cfg.Init)
 	}
-	want := []Step{{Service: "diamond", Command: []string{"rake", "db:migrate"}}}
+	want := []Step{{Service: "api", Command: []string{"rake", "db:migrate"}}}
 	if !reflect.DeepEqual(cfg.AfterRestore, want) {
 		t.Errorf("after_restore = %+v", cfg.AfterRestore)
 	}
 	if got := cfg.Suites["acceptance"].Profiles; !reflect.DeepEqual(got, []string{"acceptance"}) {
 		t.Errorf("acceptance profiles = %v", got)
 	}
-	if got := cfg.Suites["model-train"].Needs; !reflect.DeepEqual(got, []string{"postgres"}) {
-		t.Errorf("model-train needs = %v", got)
+	if got := cfg.Suites["ml-train"].Needs; !reflect.DeepEqual(got, []string{"postgres"}) {
+		t.Errorf("ml-train needs = %v", got)
 	}
 	if cfg.Snapshot == nil {
 		t.Fatal("snapshot not read")
 	}
 	if !reflect.DeepEqual(cfg.Snapshot.Volumes, []string{"postgres"}) ||
 		len(cfg.Snapshot.KeyFiles) != 2 ||
-		!reflect.DeepEqual(cfg.Snapshot.StampFiles, []string{"src/diamond/db/structure.sql"}) {
+		!reflect.DeepEqual(cfg.Snapshot.StampFiles, []string{"src/api/db/schema.sql"}) {
 		t.Errorf("snapshot = %+v", cfg.Snapshot)
 	}
 }
@@ -185,7 +185,7 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"unknown snapshot key":               {base + "snapshot:\n  volumes: [pg]\n  stamp: [x]\n", "field stamp not found"},
 		"uppercase port name":                {base + "ports: [Postgres]\n", `port name "Postgres"`},
 		"port name starting with a digit":    {base + "ports: [2db]\n", `port name "2db"`},
-		"port name with a dash":              {base + "ports: [nick-https]\n", `port name "nick-https"`},
+		"port name with a dash":              {base + "ports: [web-https]\n", `port name "web-https"`},
 		"duplicate port":                     {base + "ports: [db, db]\n", "listed twice"},
 		"init step without service":          {base + "init:\n  - command: [\"true\"]\n", "init[0]: needs a service"},
 		"init step without command":          {base + "init:\n  - service: db\n", "init[0]: needs a command"},

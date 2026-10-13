@@ -7,10 +7,10 @@
         {"type": "volume", "source": "postgres", "target": "/var/lib/postgresql/data"}
       ]
     },
-    "diamond": {
-      "image": "diamond:latest",
+    "api": {
+      "image": "api:latest",
       "volumes": [
-        {"type": "bind", "source": "/work/wt/src/diamond", "target": "/app"},
+        {"type": "bind", "source": "/work/wt/src/api", "target": "/app"},
         {"type": "volume", "source": "postgres", "target": "/pgdata", "read_only": true}
       ]
     },

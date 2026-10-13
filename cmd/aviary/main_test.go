@@ -143,7 +143,7 @@ func lsFixture(t *testing.T) (h *harness, liveRoot string) {
 	if err := h.reg.SetInitialized("aviary-live-111111", true); err != nil {
 		t.Fatal(err)
 	}
-	h.register(t, "aviary-gone-222222", "/nonexistent/aviary-test/gone", "/defs/fdy")
+	h.register(t, "aviary-gone-222222", "/nonexistent/aviary-test/gone", "/defs/myrepo")
 	h.projects = []compose.Project{
 		{Name: "aviary-live-111111", Status: "running(2)"},
 		{Name: "someone-elses", Status: "running(1)"},
@@ -166,7 +166,7 @@ func TestLsJSONJoinsRegistryWithComposeStatus(t *testing.T) {
 		{
 			"project": "aviary-gone-222222", "status": "down", "root": "/nonexistent/aviary-test/gone",
 			"branch": "", "worktree_missing": true, "initialized": false,
-			"ports": map[string]any{}, "config": "/defs/fdy",
+			"ports": map[string]any{}, "config": "/defs/myrepo",
 		},
 		{
 			"project": "aviary-live-111111", "status": "running(2)", "root": liveRoot,
@@ -205,7 +205,7 @@ func TestLsTable(t *testing.T) {
 	}
 	for i, want := range [][]string{
 		{"PROJECT", "STATUS", "BRANCH", "WORKTREE", "CONFIG", "PORTS"},
-		{"aviary-gone-222222", "down", "(worktree", "missing)", "-", "/nonexistent/aviary-test/gone", "/defs/fdy", "-"},
+		{"aviary-gone-222222", "down", "(worktree", "missing)", "-", "/nonexistent/aviary-test/gone", "/defs/myrepo", "-"},
 		{"aviary-live-111111", "running(2)", "branch-of-" + filepath.Base(liveRoot), liveRoot, "in-tree", "postgres=20000", "redis=20001"},
 	} {
 		if got := strings.Fields(lines[i]); !slices.Equal(got, want) {
