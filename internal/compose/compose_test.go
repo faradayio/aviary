@@ -143,6 +143,17 @@ func TestExitErrorPassesOtherErrorsThrough(t *testing.T) {
 	}
 }
 
+func TestExitErrorNamesTheSignalInsteadOfAStatus(t *testing.T) {
+	err := exitError(exec.Command("sh", "-c", "kill -TERM $$").Run())
+	var ee *ExitError
+	if err == nil || errors.As(err, &ee) {
+		t.Fatalf("err = %v (%T), want a signal error that is not an *ExitError", err, err)
+	}
+	if want := "docker compose terminated by signal terminated"; err.Error() != want {
+		t.Fatalf("Error() = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestParseResolved(t *testing.T) {
 	data, err := os.ReadFile("testdata/config.json")
 	if err != nil {

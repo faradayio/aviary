@@ -226,16 +226,17 @@ func (a *app) envCmd() *cobra.Command {
 			if asJSON {
 				return printJSON(out, s.Env())
 			}
-			for _, line := range s.EnvLines() {
-				if export {
-					line = "export " + line
-				}
+			lines := s.EnvLines()
+			if export {
+				lines = s.ExportLines()
+			}
+			for _, line := range lines {
 				fmt.Fprintln(out, line)
 			}
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&export, "export", false, "prefix each line with export, for eval in a shell")
+	cmd.Flags().BoolVar(&export, "export", false, "print export lines with quoted values, for eval in a shell")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print as a JSON object")
 	cmd.MarkFlagsMutuallyExclusive("export", "json")
 	return cmd

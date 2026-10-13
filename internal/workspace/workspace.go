@@ -17,8 +17,9 @@ import (
 	"github.com/faradayio/aviary/internal/config"
 )
 
-// ProjectPrefix marks compose projects that aviary owns, so `aviary ls` can
-// tell them apart from stacks started by hand.
+// ProjectPrefix namespaces the compose projects aviary creates, so they are
+// recognizable in `docker compose ls` next to stacks started by hand.
+// `aviary ls` itself lists registry entries and does not filter on it.
 const ProjectPrefix = "aviary-"
 
 type Workspace struct {

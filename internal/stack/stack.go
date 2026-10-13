@@ -127,10 +127,24 @@ func (s *Stack) Env() map[string]string {
 
 // EnvLines renders Env as KEY=VALUE lines sorted by key.
 func (s *Stack) EnvLines() []string {
+	return s.envLines(func(k, v string) string { return k + "=" + v })
+}
+
+// ExportLines renders Env as `export KEY='VALUE'` lines sorted by key. Each
+// value is single-quoted, and a quote inside it closes the quoting, adds an
+// escaped quote and reopens, so a shell that evals the lines takes roots
+// holding spaces, $, quotes or parentheses literally.
+func (s *Stack) ExportLines() []string {
+	return s.envLines(func(k, v string) string {
+		return "export " + k + "='" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+	})
+}
+
+func (s *Stack) envLines(line func(k, v string) string) []string {
 	env := s.Env()
 	lines := make([]string, 0, len(env))
 	for _, k := range slices.Sorted(maps.Keys(env)) {
-		lines = append(lines, k+"="+env[k])
+		lines = append(lines, line(k, env[k]))
 	}
 	return lines
 }
@@ -157,8 +171,9 @@ func (s *Stack) run(extraProfiles []string, args ...string) error {
 }
 
 // Init seeds the stack's volumes by running each init step in a fresh
-// container, in order. Unless force is set, it is a no-op once that has
-// happened for the current volumes. A failing step stops the sequence and
+// container, in order. Unless force is set, it is a no-op once init has run
+// since the stack was created or since aviary last removed its volumes
+// (`down --volumes` or `rm`). A failing step stops the sequence and
 // leaves the stack uninitialized, with the partial state kept for
 // inspection.
 func (s *Stack) Init(force bool) error {

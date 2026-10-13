@@ -290,7 +290,12 @@ func TestRmUnknownProjectFails(t *testing.T) {
 }
 
 func TestEnvExportAndJSON(t *testing.T) {
-	root := tempDir(t)
+	// The root holds characters a shell would expand or split on, so the
+	// export lines are only right if eval hands the root back unchanged.
+	root := filepath.Join(tempDir(t), "it's a $dir (copy)")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
 	t.Chdir(root)
 	h := newHarness(t)
@@ -300,13 +305,28 @@ func TestEnvExportAndJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 || !slices.Contains(lines, "export AVIARY_PORT_POSTGRES=20000") || !slices.Contains(lines, "export AVIARY_ROOT="+root) {
+	if len(lines) != 5 || !slices.Contains(lines, "export AVIARY_PORT_POSTGRES='20000'") {
 		t.Errorf("env --export =\n%s", out)
 	}
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "export ") {
 			t.Errorf("env --export line %q lacks export", line)
 		}
+	}
+	evaled, err := exec.Command("sh", "-c", `eval "$1"; printf '%s\n' "$AVIARY_ROOT" "$AVIARY_PORT_POSTGRES"`, "sh", out).Output()
+	if err != nil {
+		t.Fatalf("eval of env --export: %v", err)
+	}
+	if want := root + "\n20000\n"; string(evaled) != want {
+		t.Errorf("after eval of env --export, AVIARY_ROOT and AVIARY_PORT_POSTGRES =\n%q, want\n%q", evaled, want)
+	}
+
+	out, err = h.run(t, "env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(strings.Split(out, "\n"), "AVIARY_ROOT="+root) {
+		t.Errorf("env without --export should print bare KEY=VALUE lines:\n%s", out)
 	}
 
 	out, err = h.run(t, "env", "--json")

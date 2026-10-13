@@ -38,8 +38,10 @@ type Entry struct {
 	Config    string         `json:"config"`
 	Ports     map[string]int `json:"ports"`
 	CreatedAt time.Time      `json:"created_at"`
-	// InitializedAt is set once the stack's init steps have run against
-	// its current volumes, and cleared when the volumes are removed.
+	// InitializedAt is set once the stack's init steps have run since the
+	// stack was created or since aviary last removed its volumes (`down
+	// --volumes` or `rm`), and cleared by that removal. Volumes removed
+	// any other way leave it set.
 	InitializedAt *time.Time `json:"initialized_at,omitempty"`
 }
 

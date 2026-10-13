@@ -178,6 +178,7 @@ func TestLoadRejectsBadInput(t *testing.T) {
 	cases := map[string]struct{ body, want string }{
 		"no compose section":                 {"ports: [postgres]\n", "compose.files"},
 		"empty compose files":                {"compose:\n  files: []\n", "compose.files"},
+		"empty compose file":                 {"compose:\n  files: [compose.yaml, \"\"]\n", "compose.files[1] is empty"},
 		"empty stack profile":                {"compose:\n  files: [a.yaml]\n  profiles: [\"\"]\n", "compose.profiles[0] is empty"},
 		"unknown top-level":                  {base + "prots: [db]\n", "field prots not found"},
 		"unknown compose key":                {"compose:\n  files: [a.yaml]\n  file: [b.yaml]\n", "field file not found"},

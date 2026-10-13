@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"syscall"
 )
 
 type Stack struct {
@@ -98,12 +99,18 @@ func (s Stack) Output(args ...string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
+// exitError turns a non-zero exit into *ExitError. A process killed by a
+// signal has no status to pass on (ExitCode is -1), so it becomes a plain
+// error naming the signal, which the CLI prints before exiting 1.
 func exitError(err error) error {
 	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return &ExitError{Code: ee.ExitCode()}
+	if !errors.As(err, &ee) {
+		return err
 	}
-	return err
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return fmt.Errorf("docker compose terminated by signal %s", ws.Signal())
+	}
+	return &ExitError{Code: ee.ExitCode()}
 }
 
 // Project is one row of `docker compose ls`.

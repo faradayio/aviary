@@ -258,6 +258,36 @@ func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 	}
 }
 
+func TestExportLinesSingleQuoteEveryValue(t *testing.T) {
+	s, _ := newStack(t, &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Ports:   []string{"postgres"},
+	})
+	s.Workspace.Root = "/work/a b$HOME'c(d)"
+	lines := s.ExportLines()
+	if !slices.IsSorted(lines) {
+		t.Errorf("ExportLines = %q, want sorted lines", lines)
+	}
+	for _, want := range []string{
+		`export AVIARY_PORT_POSTGRES='20000'`,
+		`export AVIARY_ROOT='/work/a b$HOME'\''c(d)'`,
+	} {
+		if !slices.Contains(lines, want) {
+			t.Errorf("ExportLines = %q, want a line %s", lines, want)
+		}
+	}
+
+	// A shell that evals the lines must see the root byte for byte.
+	script := strings.Join(lines, "\n") + "\nprintf %s \"$AVIARY_ROOT\""
+	out, err := exec.Command("sh", "-c", script).Output()
+	if err != nil {
+		t.Fatalf("sh -c on the export lines: %v", err)
+	}
+	if string(out) != s.Workspace.Root {
+		t.Errorf("AVIARY_ROOT after eval = %q, want %q", out, s.Workspace.Root)
+	}
+}
+
 func initConfig() *config.Config {
 	return &config.Config{
 		Compose: config.Compose{Files: []string{"compose.yaml"}},

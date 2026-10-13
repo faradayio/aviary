@@ -217,7 +217,7 @@ with exit status 1.
 | `root`             | string  | worktree root                                                            |
 | `branch`           | string  | current git branch of the root, empty when unknown or detached           |
 | `worktree_missing` | boolean | the root no longer exists; `aviary gc` will remove the stack             |
-| `initialized`      | boolean | init has run against the stack's current volumes                         |
+| `initialized`      | boolean | init has run since the stack was created or since aviary last removed its volumes (`down --volumes` or `rm`) |
 | `ports`            | object  | port name to host port                                                   |
 | `config`           | string  | `in-tree`, or the external definition directory                          |
 

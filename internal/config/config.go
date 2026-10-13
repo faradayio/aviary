@@ -26,7 +26,9 @@ type Config struct {
 	// aviary calls compose, so a missing credential fails with a clear
 	// message instead of a service boot failure.
 	RequireEnv []string `yaml:"require_env"`
-	// Init seeds a fresh stack from scratch, once per set of volumes.
+	// Init seeds a fresh stack from scratch. It runs once after the stack is
+	// created and again after aviary removes its volumes (`down --volumes`
+	// or `rm`).
 	Init []Step `yaml:"init"`
 	// AfterRestore brings a volume restored from a snapshot up to the
 	// worktree's schema, for example by running migrations.
@@ -114,6 +116,9 @@ func Load(dir string) (*Config, error) {
 func (c *Config) validate() error {
 	if len(c.Compose.Files) == 0 {
 		return fmt.Errorf("compose.files must list at least one compose file")
+	}
+	if err := noEmpty("compose.files", c.Compose.Files); err != nil {
+		return err
 	}
 	if err := noEmpty("compose.profiles", c.Compose.Profiles); err != nil {
 		return err
