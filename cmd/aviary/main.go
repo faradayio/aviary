@@ -52,7 +52,7 @@ func newApp() *app {
 		openRegistry: registry.Open,
 		listProjects: compose.ListProjects,
 		downProject:  compose.DownProject,
-		runCompose:   func(c compose.Stack, args ...string) error { return c.Run(args...) },
+		runCompose:   compose.Stack.Run,
 		branch:       workspace.Branch,
 	}
 }

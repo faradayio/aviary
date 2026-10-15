@@ -37,15 +37,11 @@ type recorder struct {
 	fail  func(args []string) error
 }
 
-type recordingRunner struct {
-	rec *recorder
-	c   compose.Stack
-}
-
-func (r recordingRunner) Run(args ...string) error {
-	r.rec.calls = append(r.rec.calls, r.c.Args(args...))
-	if r.rec.fail != nil {
-		return r.rec.fail(args)
+// run is a Stack runner that records the call instead of running it.
+func (r *recorder) run(c compose.Stack, args ...string) error {
+	r.calls = append(r.calls, c.Args(args...))
+	if r.fail != nil {
+		return r.fail(args)
 	}
 	return nil
 }
@@ -66,7 +62,7 @@ func newStack(t *testing.T, cfg *config.Config) (*Stack, *recorder) {
 		Workspace: ws,
 		Entry:     entry,
 		registry:  reg,
-		runner:    func(c compose.Stack) Runner { return recordingRunner{rec, c} },
+		runner:    rec.run,
 	}
 	return s, rec
 }
@@ -96,17 +92,14 @@ func assertCalls(t *testing.T, rec *recorder, want ...[]string) {
 
 func entryFor(t *testing.T, s *Stack) registry.Entry {
 	t.Helper()
-	entries, err := s.registry.List()
+	e, ok, err := s.registry.Get(s.Workspace.Project())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		if e.Project == s.Workspace.Project() {
-			return e
-		}
+	if !ok {
+		t.Fatalf("%s not in the registry", s.Workspace.Project())
 	}
-	t.Fatalf("%s not in the registry", s.Workspace.Project())
-	return registry.Entry{}
+	return e
 }
 
 func writeDefinition(t *testing.T, dir, body string) {
@@ -289,7 +282,7 @@ func TestDownVolumesOnAnUnregisteredStackDoesNotRegisterIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &recorder{}
-	s.runner = func(c compose.Stack) Runner { return recordingRunner{rec, c} }
+	s.runner = rec.run
 
 	if err := s.Down(true); err != nil {
 		t.Fatal(err)

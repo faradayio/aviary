@@ -7,10 +7,11 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 
 	"gopkg.in/yaml.v3"
 )
@@ -148,12 +149,7 @@ func (c *Config) validate() error {
 			return fmt.Errorf("after_restore[%d]: %w", i, err)
 		}
 	}
-	names := make([]string, 0, len(c.Suites))
-	for name := range c.Suites {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(c.Suites)) {
 		if err := c.Suites[name].validate(); err != nil {
 			return fmt.Errorf("suite %q: %w", name, err)
 		}

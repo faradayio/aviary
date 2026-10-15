@@ -19,12 +19,6 @@ import (
 	"github.com/faradayio/aviary/internal/workspace"
 )
 
-// Runner executes one compose subcommand against a stack. compose.Stack
-// satisfies it.
-type Runner interface {
-	Run(args ...string) error
-}
-
 type Stack struct {
 	Config    *config.Config
 	Workspace workspace.Workspace
@@ -34,9 +28,9 @@ type Stack struct {
 	// registered.
 	Entry    registry.Entry
 	registry *registry.Registry
-	// runner turns a compose invocation into something that can run it.
+	// runner runs one compose subcommand against a compose invocation.
 	// Tests replace it to record argv instead of calling Docker.
-	runner func(compose.Stack) Runner
+	runner func(c compose.Stack, args ...string) error
 }
 
 // Options adjusts how Load builds a stack.
@@ -50,8 +44,7 @@ type Options struct {
 	// register one. An unregistered stack gets no ports, and its compose
 	// files fall back to their own defaults.
 	NoAllocate bool
-	// Registry is where ports are allocated. Nil means the machine-wide
-	// registry from registry.Open.
+	// Registry is where ports are allocated. It is required.
 	Registry *registry.Registry
 }
 
@@ -62,13 +55,6 @@ type Options struct {
 // require_env must be set in the host environment; otherwise Load fails
 // listing all the missing names, before touching the registry.
 func Load(cwd, configDir string, opts Options) (*Stack, error) {
-	reg := opts.Registry
-	if reg == nil {
-		var err error
-		if reg, err = registry.Open(); err != nil {
-			return nil, err
-		}
-	}
 	ws, err := workspace.Detect(cwd, configDir)
 	if err != nil {
 		return nil, err
@@ -82,24 +68,24 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 			return nil, fmt.Errorf("%s: %w", filepath.Join(ws.Definition, config.FileName), err)
 		}
 	}
-	s := &Stack{Config: cfg, Workspace: ws, registry: reg, runner: composeRunner}
+	reg := opts.Registry
+	var entry registry.Entry
 	if opts.NoAllocate {
-		entry, _, err := reg.Get(ws.Project())
-		if err != nil {
-			return nil, err
+		entry, _, err = reg.Get(ws.Project())
+	} else {
+		// The registry records an external definition's directory, and
+		// nothing for an in-tree one.
+		source := ""
+		if ws.External {
+			source = ws.Definition
 		}
-		s.Entry = entry
-		return s, nil
+		entry, err = reg.Allocate(ws.Project(), ws.Root, source, cfg.Ports)
 	}
-	entry, err := reg.Allocate(ws.Project(), ws.Root, s.configSource(), cfg.Ports)
 	if err != nil {
 		return nil, err
 	}
-	s.Entry = entry
-	return s, nil
+	return &Stack{Config: cfg, Workspace: ws, Entry: entry, registry: reg, runner: compose.Stack.Run}, nil
 }
-
-func composeRunner(c compose.Stack) Runner { return c }
 
 // checkRequiredEnv treats an empty variable as missing: an empty credential
 // fails the same way an unset one does, only later and less clearly.
@@ -114,15 +100,6 @@ func checkRequiredEnv(names []string) error {
 		return fmt.Errorf("require_env: not set in the environment: %s", strings.Join(missing, ", "))
 	}
 	return nil
-}
-
-// configSource is what the registry records as the definition's location:
-// the definition directory when it is external, empty when it is in-tree.
-func (s *Stack) configSource() string {
-	if s.Workspace.External {
-		return s.Workspace.Definition
-	}
-	return ""
 }
 
 // Env is the environment aviary adds for compose interpolation and for
@@ -182,7 +159,7 @@ func (s *Stack) Compose() compose.Stack {
 func (s *Stack) run(extraProfiles []string, args ...string) error {
 	c := s.Compose()
 	c.Profiles = slices.Concat(c.Profiles, extraProfiles)
-	return s.runner(c).Run(args...)
+	return s.runner(c, args...)
 }
 
 // Init seeds the stack's volumes by running each init step in a fresh
