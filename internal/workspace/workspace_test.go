@@ -317,3 +317,37 @@ func TestDetectTreatsAGitFileAsABoundary(t *testing.T) {
 		t.Fatalf("walk-up crossed a .git file and found %q", ws.Definition)
 	}
 }
+
+func TestDetectFromAMisCasedPathGivesTheSameRootAndSlug(t *testing.T) {
+	dir := tempDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "a"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "A")); err != nil {
+		t.Skip("the temp directory's filesystem is case-sensitive")
+	}
+	root := mkdir(t, dir, "Repo")
+	writeDefinition(t, root)
+	nested := mkdir(t, root, "Src")
+
+	want, err := Detect(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want.Root != root {
+		t.Fatalf("Root = %q, want %q", want.Root, root)
+	}
+	for _, cwd := range []string{
+		filepath.Join(dir, "repo"),
+		strings.ToUpper(root),
+		strings.ToLower(nested),
+	} {
+		ws, err := Detect(cwd, "")
+		if err != nil {
+			t.Fatalf("Detect(%q): %v", cwd, err)
+		}
+		if ws.Root != want.Root || ws.Slug != want.Slug {
+			t.Errorf("Detect(%q): Root = %q, Slug = %q; want %q, %q", cwd, ws.Root, ws.Slug, want.Root, want.Slug)
+		}
+	}
+}

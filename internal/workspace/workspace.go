@@ -46,8 +46,9 @@ func (w Workspace) Project() string {
 // a parent, up to the enclosing git checkout's top directory, wins, and its
 // directory is both Root and Definition. Otherwise configDir (from --config or
 // AVIARY_CONFIG, empty when neither is set) must hold aviary.yml, and Root is
-// the git toplevel of cwd. Paths are absolute with symlinks resolved, so the
-// same worktree always gets the same slug.
+// the git toplevel of cwd. Paths are absolute, with symlinks resolved and each
+// component spelled as its directory stores it, so the same worktree always
+// gets the same slug.
 func Detect(cwd, configDir string) (Workspace, error) {
 	cwd, err := canonical(cwd)
 	if err != nil {
@@ -95,7 +96,59 @@ func canonical(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.EvalSymlinks(abs)
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return storedSpelling(resolved), nil
+}
+
+// storedSpelling respells each component of a symlink-free absolute path the
+// way its parent directory stores it. On a case-insensitive filesystem (macOS
+// by default) /users/me/repo and /Users/me/repo are the same directory, and
+// neither os.Getwd, which returns $PWD as typed, nor filepath.EvalSymlinks
+// fixes the case, so without this one worktree would get two slugs. A
+// component whose stored spelling cannot be found is kept as given.
+func storedSpelling(path string) string {
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path
+	}
+	parent = storedSpelling(parent)
+	return filepath.Join(parent, storedName(parent, filepath.Base(path)))
+}
+
+// storedName returns the entry of parent that is the same file as
+// parent/name, matching names case-insensitively, or name when there is none
+// or parent cannot be listed. It reads parent in batches and stops at the
+// first match.
+func storedName(parent, name string) string {
+	want, err := os.Lstat(filepath.Join(parent, name))
+	if err != nil {
+		return name
+	}
+	f, err := os.Open(parent)
+	if err != nil {
+		return name
+	}
+	defer f.Close()
+	for {
+		names, err := f.Readdirnames(256)
+		for _, n := range names {
+			if n == name {
+				return name
+			}
+			if !strings.EqualFold(n, name) {
+				continue
+			}
+			if fi, err := os.Lstat(filepath.Join(parent, n)); err == nil && os.SameFile(fi, want) {
+				return n
+			}
+		}
+		if err != nil {
+			return name
+		}
+	}
 }
 
 // findUp returns the nearest directory at or above dir that holds aviary.yml,
