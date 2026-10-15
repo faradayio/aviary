@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"syscall"
 )
@@ -41,6 +42,20 @@ type ExitError struct {
 
 func (e *ExitError) Error() string {
 	return fmt.Sprintf("docker compose exited with status %d", e.Code)
+}
+
+// projectName is compose's own rule for a project name.
+var projectName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// ValidProjectName rejects a name compose would not accept as given. An
+// empty --project-name is the dangerous case: compose then falls back to
+// COMPOSE_PROJECT_NAME or the compose file in the working directory, so a
+// `down --volumes` would remove some other project's volumes.
+func ValidProjectName(name string) error {
+	if !projectName.MatchString(name) {
+		return fmt.Errorf("invalid compose project name %q: want lowercase letters, digits, '-' and '_', starting with a letter or digit", name)
+	}
+	return nil
 }
 
 // Args returns the argv after `docker` for a compose subcommand:
@@ -79,6 +94,9 @@ func (s Stack) command(sub ...string) *exec.Cmd {
 
 // Run executes a compose subcommand with the terminal attached.
 func (s Stack) Run(args ...string) error {
+	if err := ValidProjectName(s.Project); err != nil {
+		return err
+	}
 	cmd := s.command(args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -89,6 +107,9 @@ func (s Stack) Run(args ...string) error {
 // Output executes a compose subcommand and returns its stdout. Stderr still
 // goes to the terminal so compose's own diagnostics are not lost.
 func (s Stack) Output(args ...string) ([]byte, error) {
+	if err := ValidProjectName(s.Project); err != nil {
+		return nil, err
+	}
 	cmd := s.command(args...)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -143,7 +164,11 @@ func parseProjects(out []byte) ([]Project, error) {
 // DownProject removes a project's containers, networks and volumes using
 // only its name. Compose can do this from container labels alone, which is
 // what makes cleanup possible after the worktree and its files are gone.
+// An invalid name is refused before compose runs.
 func DownProject(name string) error {
+	if err := ValidProjectName(name); err != nil {
+		return err
+	}
 	cmd := exec.Command("docker", downProjectArgs(name)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

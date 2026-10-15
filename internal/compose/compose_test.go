@@ -2,9 +2,12 @@ package compose
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -211,5 +214,73 @@ func TestDownProjectArgsUseNameOnly(t *testing.T) {
 	want := []string{"compose", "--project-name", "aviary-gone-ffffff", "down", "--volumes", "--remove-orphans"}
 	if got := downProjectArgs("aviary-gone-ffffff"); !slices.Equal(got, want) {
 		t.Fatalf("downProjectArgs = %q, want %q", got, want)
+	}
+}
+
+func TestValidProjectName(t *testing.T) {
+	for _, name := range []string{"aviary-wt-abc123", "p", "0a_b-c"} {
+		if err := ValidProjectName(name); err != nil {
+			t.Errorf("ValidProjectName(%q) = %v, want nil", name, err)
+		}
+	}
+	for _, name := range []string{"", "Bad Name", "-lead", "_lead", "UPPER", "a/b", "a.b"} {
+		if err := ValidProjectName(name); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q", name)) {
+			t.Errorf("ValidProjectName(%q) = %v, want an error quoting the name", name, err)
+		}
+	}
+}
+
+// fakeDocker puts a `docker` on PATH that only records that it ran, so a
+// test can tell whether compose would have been invoked.
+func fakeDocker(t *testing.T) (marker string) {
+	t.Helper()
+	bin := t.TempDir()
+	marker = filepath.Join(t.TempDir(), "ran")
+	script := "#!/bin/sh\n: > '" + marker + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	return marker
+}
+
+func ran(t *testing.T, marker string) bool {
+	t.Helper()
+	_, err := os.Stat(marker)
+	return err == nil
+}
+
+func TestDownProjectRefusesAnInvalidNameBeforeRunningCompose(t *testing.T) {
+	for _, name := range []string{"", "Bad Name"} {
+		t.Run(name, func(t *testing.T) {
+			marker := fakeDocker(t)
+			if err := DownProject(name); err == nil {
+				t.Fatalf("DownProject(%q): want an error", name)
+			}
+			if ran(t, marker) {
+				t.Fatalf("DownProject(%q) ran docker", name)
+			}
+		})
+	}
+	marker := fakeDocker(t)
+	if err := DownProject("aviary-ok-abc123"); err != nil {
+		t.Fatalf("DownProject of a valid name: %v", err)
+	}
+	if !ran(t, marker) {
+		t.Fatal("DownProject of a valid name did not run docker")
+	}
+}
+
+func TestStackRefusesAnInvalidProjectBeforeRunningCompose(t *testing.T) {
+	marker := fakeDocker(t)
+	s := Stack{Project: "", Root: t.TempDir(), Definition: "/defs", Files: []string{"compose.yaml"}}
+	if err := s.Run("down", "--volumes"); err == nil {
+		t.Fatal("Run with an empty project: want an error")
+	}
+	if _, err := s.Output("ps"); err == nil {
+		t.Fatal("Output with an empty project: want an error")
+	}
+	if ran(t, marker) {
+		t.Fatal("a stack with an empty project ran docker")
 	}
 }

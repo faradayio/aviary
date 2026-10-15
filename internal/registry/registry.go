@@ -7,10 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"syscall"
 	"time"
 
@@ -101,10 +102,11 @@ type Registry struct {
 }
 
 // Open locates the registry under the XDG state directory. It is created on
-// first write.
+// first write. A relative XDG_STATE_HOME is ignored, as the XDG spec requires,
+// so every worktree shares one registry instead of each getting its own.
 func Open() (*Registry, error) {
 	dir := os.Getenv("XDG_STATE_HOME")
-	if dir == "" {
+	if !filepath.IsAbs(dir) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return nil, err
@@ -129,10 +131,10 @@ func (r *Registry) List() ([]Entry, error) {
 		return nil, err
 	}
 	out := make([]Entry, 0, len(s.Entries))
-	for _, e := range s.Entries {
-		out = append(out, e)
+	// load guarantees each key is its entry's project.
+	for _, project := range slices.Sorted(maps.Keys(s.Entries)) {
+		out = append(out, s.Entries[project])
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Project < out[j].Project })
 	return out, nil
 }
 
@@ -259,6 +261,13 @@ func (r *Registry) load() (*state, error) {
 	}
 	if s.Entries == nil {
 		s.Entries = map[string]Entry{}
+	}
+	// An entry keyed by one project but naming another (or none) would hand
+	// callers an empty or wrong project name to take down or release.
+	for _, key := range slices.Sorted(maps.Keys(s.Entries)) {
+		if project := s.Entries[key].Project; project != key {
+			return nil, fmt.Errorf("%s: entry %q has project %q; it must equal the key (fix or delete the entry)", r.path, key, project)
+		}
 	}
 	return s, nil
 }

@@ -245,6 +245,10 @@ is listening on it. If something takes the port between allocation and
 `aviary up`, compose reports the conflict; `aviary rm` and then `aviary up`
 allocate new ports.
 
+A relative `XDG_STATE_HOME` is ignored. aviary refuses a registry file whose
+`version` it does not read, or with an entry whose `project` is missing or
+differs from its key; the error names the file and the entry to fix or delete.
+
 ## Development
 
 ```sh

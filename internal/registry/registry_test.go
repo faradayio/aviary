@@ -421,3 +421,67 @@ func TestAllocateWithTheRealProberSkipsAHeldPort(t *testing.T) {
 		t.Errorf("postgres = %d, want a port above the held %d", got, held)
 	}
 }
+
+func TestEntryWithoutAMatchingProjectIsAnErrorNamingTheFileAndKey(t *testing.T) {
+	for name, entry := range map[string]string{
+		"missing":  `{"root": "/wt/foo", "ports": {}}`,
+		"empty":    `{"project": "", "root": "/wt/foo", "ports": {}}`,
+		"mismatch": `{"project": "aviary-bar-def456", "root": "/wt/foo", "ports": {}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reg := open(t)
+			body := `{"version": 1, "entries": {"aviary-foo-abc123": ` + entry + `}}`
+			if err := os.WriteFile(reg.Path(), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			named := func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), reg.Path()) &&
+					strings.Contains(err.Error(), `"aviary-foo-abc123"`)
+			}
+			if _, err := reg.List(); !named(err) {
+				t.Errorf("List: want an error naming %s and the key, got %v", reg.Path(), err)
+			}
+			if _, _, err := reg.Get("aviary-foo-abc123"); !named(err) {
+				t.Errorf("Get: want an error naming %s and the key, got %v", reg.Path(), err)
+			}
+			if _, err := reg.Allocate("aviary-foo-abc123", "/wt/foo", "", nil); !named(err) {
+				t.Errorf("Allocate: want an error naming %s and the key, got %v", reg.Path(), err)
+			}
+			if err := reg.Release(""); !named(err) {
+				t.Errorf("Release: want an error naming %s and the key, got %v", reg.Path(), err)
+			}
+			after, err := os.ReadFile(reg.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != body {
+				t.Errorf("a registry with a bad entry must not be rewritten, now %s", after)
+			}
+		})
+	}
+}
+
+func TestOpenIgnoresARelativeXDGStateHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	want := filepath.Join(home, ".local", "state", "aviary", "registry.json")
+	for _, dir := range []string{"", "relative/dir", "."} {
+		t.Setenv("XDG_STATE_HOME", dir)
+		reg, err := Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reg.Path() != want {
+			t.Errorf("XDG_STATE_HOME=%q: Path = %s, want %s", dir, reg.Path(), want)
+		}
+	}
+	abs := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", abs)
+	reg, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(abs, "aviary", "registry.json"); reg.Path() != want {
+		t.Errorf("absolute XDG_STATE_HOME: Path = %s, want %s", reg.Path(), want)
+	}
+}
