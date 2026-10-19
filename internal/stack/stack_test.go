@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -171,8 +172,8 @@ func TestLoadSkipRequireEnvLoadsWithMissingNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Entry.Ports["postgres"] != registry.FirstPort {
-		t.Errorf("Ports = %v, want postgres at %d", s.Entry.Ports, registry.FirstPort)
+	if base := registry.BasePort(s.Workspace.Project()); s.Entry.Ports["postgres"] != base {
+		t.Errorf("Ports = %v, want postgres at %d", s.Entry.Ports, base)
 	}
 }
 
@@ -192,8 +193,9 @@ func TestLoadAllocatesPortsForAnInTreeDefinition(t *testing.T) {
 	if s.Workspace.Root != root || s.Workspace.External {
 		t.Errorf("Workspace = %+v, want in-tree root %s", s.Workspace, root)
 	}
-	if got := s.Entry.Ports; got["postgres"] != registry.FirstPort || got["redis"] != registry.FirstPort+1 {
-		t.Errorf("Ports = %v, want postgres and redis from %d", got, registry.FirstPort)
+	base := registry.BasePort(s.Workspace.Project())
+	if got := s.Entry.Ports; got["postgres"] != base || got["redis"] != base+1 {
+		t.Errorf("Ports = %v, want postgres and redis from %d", got, base)
 	}
 	if e := entryFor(t, s); e.Config != "" || e.Root != root {
 		t.Errorf("registry entry = %+v, want root %s and empty config for an in-tree definition", e, root)
@@ -261,7 +263,7 @@ func TestLoadNoAllocateUsesTheRegisteredPortsWithoutWriting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := map[string]int{"postgres": registry.FirstPort}; !maps.Equal(s.Entry.Ports, want) {
+	if want := map[string]int{"postgres": registry.BasePort(s.Workspace.Project())}; !maps.Equal(s.Entry.Ports, want) {
 		t.Errorf("Ports = %v, want the registered %v", s.Entry.Ports, want)
 	}
 	after, err := os.ReadFile(reg.Path())
@@ -301,14 +303,16 @@ func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 		Ports:   []string{"postgres", "redis", "web_https"},
 	})
 	env := s.Env()
+	base := registry.BasePort("aviary-wt-abc123")
+	port := func(i int) string { return strconv.Itoa(base + i) }
 	want := map[string]string{
 		"COMPOSE_PROJECT_NAME":  "aviary-wt-abc123",
 		"AVIARY_PROJECT":        "aviary-wt-abc123",
 		"AVIARY_SLUG":           "wt-abc123",
 		"AVIARY_ROOT":           "/work/wt",
-		"AVIARY_PORT_POSTGRES":  "20000",
-		"AVIARY_PORT_REDIS":     "20001",
-		"AVIARY_PORT_WEB_HTTPS": "20002",
+		"AVIARY_PORT_POSTGRES":  port(0),
+		"AVIARY_PORT_REDIS":     port(1),
+		"AVIARY_PORT_WEB_HTTPS": port(2),
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -319,10 +323,10 @@ func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 		t.Errorf("Env has %d keys, want %d: %v", len(env), len(want), env)
 	}
 	lines := s.EnvLines()
-	if !slices.IsSorted(lines) || !slices.Contains(lines, "AVIARY_PORT_REDIS=20001") {
+	if !slices.IsSorted(lines) || !slices.Contains(lines, "AVIARY_PORT_REDIS="+port(1)) {
 		t.Errorf("EnvLines = %q, want sorted KEY=VALUE lines", lines)
 	}
-	if c := s.Compose(); c.Env["AVIARY_PORT_WEB_HTTPS"] != "20002" {
+	if c := s.Compose(); c.Env["AVIARY_PORT_WEB_HTTPS"] != port(2) {
 		t.Errorf("Compose().Env = %v, want the stack's Env", c.Env)
 	}
 }
@@ -338,7 +342,7 @@ func TestExportLinesSingleQuoteEveryValue(t *testing.T) {
 		t.Errorf("ExportLines = %q, want sorted lines", lines)
 	}
 	for _, want := range []string{
-		`export AVIARY_PORT_POSTGRES='20000'`,
+		"export AVIARY_PORT_POSTGRES='" + strconv.Itoa(registry.BasePort("aviary-wt-abc123")) + "'",
 		`export AVIARY_ROOT='/work/a b$HOME'\''c(d)'`,
 	} {
 		if !slices.Contains(lines, want) {

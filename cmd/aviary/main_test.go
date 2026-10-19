@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -96,6 +97,12 @@ func (h *harness) projectNames(t *testing.T) []string {
 	return names
 }
 
+// basePort is the port a fresh registry hands the first port name of the
+// stack rooted at root, as a string.
+func basePort(root string) string {
+	return strconv.Itoa(registry.BasePort(workspace.ProjectPrefix + workspace.Slug(root)))
+}
+
 func tempDir(t *testing.T) string {
 	t.Helper()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
@@ -169,6 +176,7 @@ func TestLsJSONJoinsRegistryWithComposeStatus(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &rows); err != nil {
 		t.Fatalf("ls --json is not a JSON array: %v\n%s", err, out)
 	}
+	base := registry.BasePort("aviary-live-111111")
 	want := []map[string]any{
 		{
 			"project": "aviary-gone-222222", "status": "down", "root": "/nonexistent/aviary-test/gone",
@@ -178,7 +186,7 @@ func TestLsJSONJoinsRegistryWithComposeStatus(t *testing.T) {
 		{
 			"project": "aviary-live-111111", "status": "running(2)", "root": liveRoot,
 			"branch": "branch-of-" + filepath.Base(liveRoot), "worktree_missing": false, "initialized": true,
-			"ports":  map[string]any{"postgres": float64(registry.FirstPort), "redis": float64(registry.FirstPort + 1)},
+			"ports":  map[string]any{"postgres": float64(base), "redis": float64(base + 1)},
 			"config": "in-tree",
 		},
 	}
@@ -210,10 +218,11 @@ func TestLsTable(t *testing.T) {
 	if len(lines) != 3 {
 		t.Fatalf("ls printed %d lines, want header and two rows:\n%s", len(lines), out)
 	}
+	base := registry.BasePort("aviary-live-111111")
 	for i, want := range [][]string{
 		{"PROJECT", "STATUS", "BRANCH", "WORKTREE", "CONFIG", "PORTS"},
 		{"aviary-gone-222222", "down", "(worktree", "missing)", "-", "/nonexistent/aviary-test/gone", "/defs/myrepo", "-"},
-		{"aviary-live-111111", "running(2)", "branch-of-" + filepath.Base(liveRoot), liveRoot, "in-tree", "postgres=20000", "redis=20001"},
+		{"aviary-live-111111", "running(2)", "branch-of-" + filepath.Base(liveRoot), liveRoot, "in-tree", "postgres=" + strconv.Itoa(base), "redis=" + strconv.Itoa(base+1)},
 	} {
 		if got := strings.Fields(lines[i]); !slices.Equal(got, want) {
 			t.Errorf("line %d = %q, want fields %q", i, lines[i], want)
@@ -405,8 +414,8 @@ suites:
 	if _, err := h.run(t, "ps"); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.composed[len(h.composed)-1].stack.Env["AVIARY_PORT_POSTGRES"]; got != "20000" {
-		t.Errorf("ps on a registered stack set AVIARY_PORT_POSTGRES=%q, want the registered 20000", got)
+	if got, want := h.composed[len(h.composed)-1].stack.Env["AVIARY_PORT_POSTGRES"], basePort(root); got != want {
+		t.Errorf("ps on a registered stack set AVIARY_PORT_POSTGRES=%q, want the registered %s", got, want)
 	}
 }
 
@@ -420,13 +429,14 @@ func TestEnvExportAndJSON(t *testing.T) {
 	writeDefinition(t, root, "compose: {files: [compose.yaml]}\nports: [postgres]\n")
 	t.Chdir(root)
 	h := newHarness(t)
+	port := basePort(root)
 
 	out, err := h.run(t, "env", "--export")
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 || !slices.Contains(lines, "export AVIARY_PORT_POSTGRES='20000'") {
+	if len(lines) != 5 || !slices.Contains(lines, "export AVIARY_PORT_POSTGRES='"+port+"'") {
 		t.Errorf("env --export =\n%s", out)
 	}
 	for _, line := range lines {
@@ -438,7 +448,7 @@ func TestEnvExportAndJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("eval of env --export: %v", err)
 	}
-	if want := root + "\n20000\n"; string(evaled) != want {
+	if want := root + "\n" + port + "\n"; string(evaled) != want {
 		t.Errorf("after eval of env --export, AVIARY_ROOT and AVIARY_PORT_POSTGRES =\n%q, want\n%q", evaled, want)
 	}
 
@@ -462,8 +472,8 @@ func TestEnvExportAndJSON(t *testing.T) {
 	if want := []string{"AVIARY_PORT_POSTGRES", "AVIARY_PROJECT", "AVIARY_ROOT", "AVIARY_SLUG", "COMPOSE_PROJECT_NAME"}; !slices.Equal(keys, want) {
 		t.Errorf("env --json keys = %v, want %v", keys, want)
 	}
-	if env["AVIARY_PORT_POSTGRES"] != "20000" {
-		t.Errorf("AVIARY_PORT_POSTGRES = %q", env["AVIARY_PORT_POSTGRES"])
+	if env["AVIARY_PORT_POSTGRES"] != port {
+		t.Errorf("AVIARY_PORT_POSTGRES = %q, want %s", env["AVIARY_PORT_POSTGRES"], port)
 	}
 
 	if _, err := h.run(t, "env", "--export", "--json"); err == nil {

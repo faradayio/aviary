@@ -88,33 +88,117 @@ func TestAllocateIsStableAndFollowsTheNameList(t *testing.T) {
 	}
 }
 
+func TestBasePortIsAFixedFunctionOfTheProjectName(t *testing.T) {
+	// Known FNV-1a answers: a change here moves every new stack's ports on
+	// every machine, so it must be deliberate.
+	for project, want := range map[string]int{"aviary-a": 51180, "aviary-b": 43560} {
+		if got := BasePort(project); got != want {
+			t.Errorf("BasePort(%q) = %d, want %d", project, got, want)
+		}
+	}
+}
+
+func TestAllocateGivesTheSameProjectTheSamePortsInAFreshRegistry(t *testing.T) {
+	var got []map[string]int
+	for range 2 {
+		entry, err := open(t).Allocate("aviary-a", "/wt/a", "", []string{"postgres", "redis"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, entry.Ports)
+	}
+	if !reflect.DeepEqual(got[0], got[1]) {
+		t.Errorf("fresh registries gave aviary-a %v and %v", got[0], got[1])
+	}
+	base := BasePort("aviary-a")
+	if want := map[string]int{"postgres": base, "redis": base + 1}; !reflect.DeepEqual(got[0], want) {
+		t.Errorf("ports = %v, want %v from the project's base", got[0], want)
+	}
+}
+
+func TestAllocateStartsDifferentProjectsAtTheirOwnBase(t *testing.T) {
+	reg := open(t)
+	for _, project := range []string{"aviary-a", "aviary-b"} {
+		entry, err := reg.Allocate(project, "/wt/"+project, "", []string{"postgres"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := entry.Ports["postgres"], BasePort(project); got != want {
+			t.Errorf("%s postgres = %d, want its base %d", project, got, want)
+		}
+	}
+}
+
 func TestAllocateSkipsPortsTheProberReportsBusy(t *testing.T) {
-	reg := open(t, FirstPort)
+	base := BasePort("aviary-a")
+	reg := open(t, base)
 	entry, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := entry.Ports["postgres"]; got != FirstPort+1 {
-		t.Errorf("postgres = %d, want %d", got, FirstPort+1)
+	if got := entry.Ports["postgres"]; got != base+1 {
+		t.Errorf("postgres = %d, want %d", got, base+1)
+	}
+}
+
+// hold registers project as owning ports, as if an earlier allocation had
+// handed them out.
+func hold(t *testing.T, reg *Registry, project string, ports map[string]int) {
+	t.Helper()
+	err := reg.update(func(s *state) error {
+		s.Entries[project] = Entry{Project: project, Root: "/wt/" + project, Ports: ports}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestAllocateSkipsPortsHeldByOtherEntriesWithoutProbingThem(t *testing.T) {
 	reg := open(t)
-	if _, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres"}); err != nil {
-		t.Fatal(err)
-	}
+	base := BasePort("aviary-b")
+	hold(t, reg, "aviary-other", map[string]int{"postgres": base, "redis": base + 1})
 	probed := map[int]bool{}
 	reg.Prober = recordingProber(probed)
-	b, err := reg.Allocate("aviary-b", "/wt/b", "", []string{"postgres"})
+	b, err := reg.Allocate("aviary-b", "/wt/b", "", []string{"postgres", "redis"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.Ports["postgres"] != FirstPort+1 {
-		t.Errorf("postgres = %d, want %d", b.Ports["postgres"], FirstPort+1)
+	if want := map[string]int{"postgres": base + 2, "redis": base + 3}; !reflect.DeepEqual(b.Ports, want) {
+		t.Errorf("ports = %v, want %v after the other stack's", b.Ports, want)
 	}
-	if probed[FirstPort] {
-		t.Errorf("port %d belongs to aviary-a and should not have been probed", FirstPort)
+	for _, port := range []int{base, base + 1} {
+		if probed[port] {
+			t.Errorf("port %d belongs to aviary-other and should not have been probed", port)
+		}
+	}
+}
+
+func TestAllocateWrapsFromTheTopOfTheRangeToFirstPort(t *testing.T) {
+	base := BasePort("aviary-a")
+	var busy []int
+	for port := base; port < lastPort; port++ {
+		busy = append(busy, port)
+	}
+	reg := open(t, busy...)
+	entry, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres", "redis"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]int{"postgres": lastPort, "redis": FirstPort}; !reflect.DeepEqual(entry.Ports, want) {
+		t.Errorf("ports = %v, want %v: the last port, then a wrap to the first", entry.Ports, want)
+	}
+}
+
+func TestAllocateKeepsPortsOutsideTheCurrentRange(t *testing.T) {
+	reg := open(t)
+	hold(t, reg, "aviary-a", map[string]int{"postgres": 60000})
+	entry, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := entry.Ports["postgres"]; got != 60000 {
+		t.Errorf("postgres = %d, want the recorded 60000 kept", got)
 	}
 }
 
@@ -303,7 +387,7 @@ func TestSetInitializedRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if set.InitializedAt == nil || set.Ports["postgres"] != FirstPort || set.Root != "/wt/a" {
+	if set.InitializedAt == nil || set.Ports["postgres"] != BasePort("aviary-a") || set.Root != "/wt/a" {
 		t.Fatalf("SetInitialized returned %+v, want the whole entry with initialized_at set", set)
 	}
 	entries, err := reg.List()
@@ -398,7 +482,7 @@ func TestListenProberSeesHeldPorts(t *testing.T) {
 func TestAllocateWithTheRealProberSkipsAHeldPort(t *testing.T) {
 	reg := OpenAt(filepath.Join(t.TempDir(), "registry.json"))
 	held := 0
-	for port := FirstPort; port <= lastPort; port++ {
+	for port := BasePort("aviary-a"); port <= lastPort; port++ {
 		if (ListenProber{}).Free(port) {
 			held = port
 			break

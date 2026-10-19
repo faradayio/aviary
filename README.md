@@ -37,10 +37,13 @@ and two suites. Run `aviary test db` from that directory to try it.
 
 ### Ports
 
-Each name under `ports` gets one host port per worktree, allocated from 20000
-upward and passed to compose as `AVIARY_PORT_<NAME>` (the name upper-cased).
-Use it where the compose file publishes a port, with the usual port as the
-default so the file still works without aviary:
+Each name under `ports` gets one host port per worktree, passed to compose as
+`AVIARY_PORT_<NAME>` (the name upper-cased). Ports start at a block between
+20000 and 59999 derived from the worktree's project name, so a worktree at the
+same path gets the same ports on every machine; they move only when another
+stack or process already holds them, and once allocated they are kept.
+Use the variable where the compose file publishes a port, with the usual port
+as the default so the file still works without aviary:
 
 ```yaml
 services:

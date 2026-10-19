@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"maps"
 	"net"
 	"os"
@@ -23,12 +24,27 @@ import (
 // state is never clobbered by an older one.
 const Version = 1
 
-// FirstPort is where allocation starts. It sits above the ports development
-// stacks conventionally hardcode, so an aviary stack and a hand-started one
-// can coexist on the same machine.
+// FirstPort is the bottom of the range aviary allocates from. It sits above
+// the ports development stacks conventionally hardcode, so an aviary stack
+// and a hand-started one can coexist on the same machine.
 const FirstPort = 20000
 
-const lastPort = 60000
+// The range is cut into portSlots blocks of slotWidth ports; each project
+// name hashes to the block its allocation starts at.
+const (
+	portSlots = 2000
+	slotWidth = 20
+	lastPort  = FirstPort + portSlots*slotWidth - 1
+)
+
+// BasePort is where allocation for project starts: the first port of the
+// block its name hashes to. FNV-1a is fixed by its spec, so the same project
+// name gets the same base on every machine and with every Go release.
+func BasePort(project string) int {
+	h := fnv.New32a()
+	h.Write([]byte(project))
+	return FirstPort + int(h.Sum32()%portSlots)*slotWidth
+}
 
 type Entry struct {
 	Project string `json:"project"`
@@ -151,7 +167,9 @@ func (r *Registry) Get(project string) (Entry, bool, error) {
 
 // Allocate returns the entry for project, creating it or extending it so
 // that every name in ports has a host port. Names that already have a port
-// keep it; ports no longer named are released. config is the external
+// keep it; ports no longer named are released. A new port is the first free
+// one from BasePort(project), so a project only lands somewhere else when
+// another stack or process already holds those ports. config is the external
 // definition directory, or empty for an in-tree aviary.yml.
 func (r *Registry) Allocate(project, root, config string, ports []string) (Entry, error) {
 	var entry Entry
@@ -181,7 +199,7 @@ func (r *Registry) Allocate(project, root, config string, ports []string) (Entry
 			if _, ok := entry.Ports[name]; ok {
 				continue
 			}
-			port, err := r.nextFreePort(s)
+			port, err := r.nextFreePort(s, BasePort(project))
 			if err != nil {
 				return err
 			}
@@ -226,16 +244,18 @@ func (r *Registry) Release(project string) error {
 	})
 }
 
-// nextFreePort returns the lowest port from FirstPort that no entry holds
-// and the prober reports free.
-func (r *Registry) nextFreePort(s *state) (int, error) {
+// nextFreePort returns the first port from base upward, wrapping from
+// lastPort to FirstPort, that no entry holds and the prober reports free.
+func (r *Registry) nextFreePort(s *state, base int) (int, error) {
 	taken := map[int]bool{}
 	for _, e := range s.Entries {
 		for _, p := range e.Ports {
 			taken[p] = true
 		}
 	}
-	for port := FirstPort; port <= lastPort; port++ {
+	span := lastPort - FirstPort + 1
+	for i := range span {
+		port := FirstPort + (base-FirstPort+i)%span
 		if taken[port] || !r.Prober.Free(port) {
 			continue
 		}
