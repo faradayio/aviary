@@ -245,6 +245,151 @@ with exit status 1.
 
 These keys are stable; new keys may be added.
 
+## Worktree tools
+
+aviary needs nothing from the tool that makes a worktree. A stack belongs to
+a directory, and the first command that needs it creates it. Calling aviary
+from a worktree tool only saves typing.
+
+### Plain git
+
+```sh
+git worktree add ../myrepo-feature-x -b feature-x
+cd ../myrepo-feature-x
+aviary up                      # the first command creates the stack
+```
+
+When the work is done, remove the stack from inside the worktree and then the
+worktree, or the other way round and let `aviary gc` find the stack:
+
+```sh
+aviary rm                      # inside the worktree
+git worktree remove ../myrepo-feature-x
+
+git worktree remove ../myrepo-feature-x
+aviary gc                      # anywhere; removes every stack whose worktree is gone
+```
+
+A script that makes worktrees can do the same: `aviary up` after
+`git worktree add`, and `aviary rm` in the worktree before
+`git worktree remove`. Let a failing aviary command warn rather than fail the
+script, so a worktree is never left half made or half removed over its stack.
+
+### Claude Code
+
+Claude Code makes worktrees for `claude --worktree`, for subagents with
+`isolation: worktree` and for background sessions. Without hooks it creates
+and removes them with git and aviary needs nothing: the first `aviary up` or
+`aviary test` in the worktree creates the stack, and `aviary gc` removes it
+once Claude Code has removed the worktree.
+
+To start the stack with the worktree and remove it with the worktree, add
+`WorktreeCreate` and `WorktreeRemove` hooks to Claude Code's `settings.json`:
+
+```json
+{
+  "hooks": {
+    "WorktreeCreate": [
+      { "hooks": [{ "type": "command", "command": "$HOME/bin/aviary-worktree-create" }] }
+    ],
+    "WorktreeRemove": [
+      { "hooks": [{ "type": "command", "command": "$HOME/bin/aviary-worktree-remove" }] }
+    ]
+  }
+}
+```
+
+A `WorktreeCreate` hook replaces Claude Code's own `git worktree add`, so it
+creates the worktree itself and prints its path as the last line of stdout;
+everything else goes to stderr. This one makes the worktree where Claude Code
+would, under `.claude/worktrees/<name>` on branch `worktree-<name>`, but from
+the current `HEAD`:
+
+```sh
+#!/bin/sh
+# aviary-worktree-create: make the worktree, then start its stack.
+set -eu
+input=$(cat)
+name=$(printf '%s' "$input" | jq -r .name)
+repo=$(git -C "$(printf '%s' "$input" | jq -r .cwd)" rev-parse --show-toplevel)
+dir="$repo/.claude/worktrees/$name"
+git -C "$repo" worktree add -b "worktree-$name" "$dir" >&2
+(cd "$dir" && aviary up >&2) || echo "aviary up failed; the worktree has no stack yet" >&2
+echo "$dir"
+```
+
+A `WorktreeRemove` hook runs only for worktrees the `WorktreeCreate` hook
+made, and must delete the directory:
+
+```sh
+#!/bin/sh
+# aviary-worktree-remove: remove the stack, then the worktree.
+set -u
+dir=$(jq -r .worktree_path)
+(cd "$dir" && aviary rm >&2) || true
+git -C "$dir" worktree remove --force "$dir"
+```
+
+- The session starts only once `aviary up` has returned, which waits until the
+  stack is healthy. For a stack that is slow to start, or when most worktrees
+  will not need one, leave `aviary up` out of the create hook and keep the
+  remove hook: every subagent worktree goes through the same hooks.
+- When a subagent finishes, Claude Code keeps the worktree the hook made for it
+  and does not run `WorktreeRemove`. Remove it with `git worktree remove`, then
+  run `aviary gc`.
+- Claude Code never deletes the branch of a worktree a hook made. Delete
+  `worktree-<name>` yourself once its work is merged or abandoned.
+
+### Directories deleted by hand
+
+A worktree directory deleted with `rm -rf`, or by a tool that knows nothing
+about aviary, leaves its stack behind: containers, volumes and ports.
+`aviary ls` marks it `(worktree missing)` (`"worktree_missing": true` with
+`--json`), and `aviary gc` removes it whenever you get to it;
+`aviary gc --dry-run` lists what it would remove. git keeps listing such a
+worktree until `git worktree prune`.
+
+## Coming from a compose wrapper
+
+A per-checkout compose wrapper usually merges its compose files into
+generated ones inside the checkout, publishes fixed host ports, and offers
+verbs over `docker compose`. aviary keeps the compose files as they are,
+generates nothing, gives every worktree its own ports, and maps the usual
+verbs like this:
+
+| Wrapper verb                   | aviary                                                                                            |
+| ------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `up`, `start`                  | `aviary up [service...]`                                                                          |
+| `stop`                         | `aviary down` removes the containers and keeps the volumes; `aviary compose stop` only stops them |
+| `status`                       | `aviary ps` for this worktree's stack, `aviary ls` for every stack on the machine                 |
+| `run`                          | `aviary run <service> [command...]`                                                               |
+| `exec`, `shell`                | `aviary exec <service> <command...>`                                                              |
+| `test`                         | `aviary test <suite>`, with the suites named in `aviary.yml`                                      |
+| `logs`, `build`                | `aviary logs`, `aviary build`                                                                     |
+| `pull`                         | `aviary compose pull`                                                                             |
+| init, seed                     | `aviary init`; `aviary down --volumes` first to start from empty volumes                          |
+| source mount, unmount          | none: the compose files bind-mount the worktree's sources, so each stack always runs its own code |
+| targets, environments          | more files under `compose.files`, or [profiles](#profiles)                                        |
+| print the merged configuration | `aviary compose config`                                                                           |
+
+Sources are mounted by the compose file the definition uses for development.
+Paths are relative to the worktree root, and an anonymous volume over a
+dependency directory keeps the image's copy instead of the host's (see
+[Old dependencies after pulling an image](#old-dependencies-after-pulling-an-image)):
+
+```yaml
+services:
+  api:
+    volumes:
+      - ./src/api:/app
+      - /app/node_modules
+```
+
+Fixed host ports are what aviary replaces, so anything that reached a service
+at one, such as `localhost:5432` in a database client, now takes the port from
+`aviary env`. Configuration that embeds a fixed host port, such as a callback
+URL, does not follow the allocated port.
+
 ## How isolation works
 
 The compose project name is `aviary-<slug>`, where the slug is the worktree
@@ -265,11 +410,85 @@ Host ports are recorded in `$XDG_STATE_HOME/aviary/registry.json` (default
 skips any port another stack holds and checks that nothing else on the machine
 is listening on it. If something takes the port between allocation and
 `aviary up`, compose reports the conflict; `aviary rm` and then `aviary up`
-allocate new ports.
+allocate new ports (see [Port already allocated](#port-already-allocated)).
 
 A relative `XDG_STATE_HOME` is ignored. aviary refuses a registry file whose
 `version` it does not read, or with an entry whose `project` is missing or
 differs from its key; the error names the file and the entry to fix or delete.
+
+## Troubleshooting
+
+### Registry file errors
+
+aviary refuses a registry file it cannot trust, and the error names the file:
+
+- `registry version <n> is not supported`: a newer aviary wrote the file.
+  Upgrade aviary; an older one never overwrites a newer file.
+- A JSON parse error: the file was edited by hand. Fix the JSON.
+- `entry "<key>" has project "<name>"`: set the entry's `project` to its key,
+  or delete the entry.
+
+Deleting an entry, or the whole file, makes aviary forget those stacks without
+removing them. Their containers and volumes stay: `docker compose ls --all`
+lists them (their names start with `aviary-`), and
+`docker compose --project-name <project> down --volumes` removes one. A
+forgotten stack whose worktree still exists is registered again by the next
+command that starts it, marked uninitialized, so init runs again over the data
+its volumes still hold; run `aviary down --volumes` first to start clean.
+
+### Port already allocated
+
+aviary checks that a port is free only when it allocates it. If something
+starts listening on one of a stack's ports later, `aviary up` fails with
+compose's "port is already allocated" or "address already in use".
+`aviary env` lists the stack's ports, and
+`lsof -nP -iTCP:<port> -sTCP:LISTEN` shows what holds one.
+
+Stop that process, or give the stack new ports with `aviary rm` and then
+`aviary up`, which allocates again and skips ports in use. `aviary rm` also
+removes the stack's volumes, so its data is lost and init runs again: aviary
+cannot move a stack to new ports and keep its volumes, so free the port
+instead when the data matters.
+
+A compose file that publishes a fixed host port, such as `"5432:5432"`, fails
+the same way in the second worktree that starts it. Publish
+`${AVIARY_PORT_<NAME>:-5432}` instead (see [Ports](#ports)).
+
+### Old dependencies after pulling an image
+
+An anonymous volume over a dependency directory, such as `/app/node_modules`
+under a source bind mount, outlives the container: when compose recreates the
+container for a newer image, it keeps the old volume and so the old
+dependencies. After `aviary compose pull` or `aviary build`, start the stack
+with `aviary up --renew-anon-volumes` to refill those volumes from the new
+image. `aviary run` and `aviary test` start a new container each time, with
+new anonymous volumes, so they always see the image's copy.
+
+### Running out of memory
+
+Docker Desktop runs containers in a virtual machine with a fixed memory size,
+set under Settings, Resources; on Linux the host's memory is the limit. Every
+stack is a full copy of the services it runs, so several worktrees with the
+whole application up cost several times one. When memory runs out, containers
+are killed (exit status 137) or stop passing their health checks.
+`docker stats --no-stream $(aviary ps -q)` shows what this stack uses.
+
+Lay the definition out so that a bare `aviary up` starts only what most work
+needs, usually the databases and caches, and put each heavier group of
+services behind a [profile](#profiles). The same machine then holds one full
+stack or several lean ones. Within a stack, start more only when needed:
+
+- `aviary up <service>` starts a service even when it sits behind a profile.
+- `aviary compose --profile <name> up --detach --wait` starts a whole profile.
+  `COMPOSE_PROFILES=<name> aviary up` does the same only when `aviary.yml`
+  sets no stack-wide profiles, because the `--profile` flags aviary passes
+  override that variable.
+- A suite starts only its `needs`, with its own profiles.
+
+`aviary down` in worktrees not in use frees their memory and keeps their data.
+A memory limit in a compose file (`deploy.resources.limits.memory`) caps one
+service, so a runaway service is killed on its own instead of starving every
+stack.
 
 ## Development
 
