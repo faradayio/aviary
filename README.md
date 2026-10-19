@@ -18,9 +18,29 @@ without it.
 
 aviary needs Docker with Compose v2.
 
+With Homebrew on macOS:
+
+```sh
+brew install faradayio/tap/aviary
+```
+
+The tap and the releases page are filled in by the first tagged release;
+until then, use `go install`.
+
+With Go 1.27.1 or later (prints `dev` for `aviary --version`):
+
 ```sh
 go install github.com/faradayio/aviary/cmd/aviary@latest
 ```
+
+Or download the archive for your platform from the
+[releases page](https://github.com/faradayio/aviary/releases), named
+`aviary_<version>_<os>_<arch>.tar.gz` for `darwin` or `linux` on `amd64` or
+`arm64`, check it against `checksums.txt`, and put the `aviary` binary on your
+`PATH`. macOS quarantines a binary downloaded by a browser; clear that with
+`xattr -d com.apple.quarantine aviary`.
+
+`aviary --version` prints the installed version.
 
 ## Set up a repository
 
@@ -264,6 +284,12 @@ go test -tags integration ./cmd/aviary         # runs examples/minimal end to en
 The integration test uses temporary XDG state and cache directories, so it
 never touches the machine's registry, and removes its compose project even
 when it fails.
+
+Pushing a `v*` tag runs the release workflow: GoReleaser builds the archives
+and checksums, publishes the GitHub release, and updates the Homebrew cask in
+`faradayio/homebrew-tap` when the `HOMEBREW_TAP_GITHUB_TOKEN` secret is set and
+the tag is not a prerelease. `goreleaser release --snapshot --clean` builds the
+same archives into `dist/` locally without publishing anything.
 
 ## License
 

@@ -139,6 +139,35 @@ func TestHelpListsEveryCommand(t *testing.T) {
 	}
 }
 
+func TestVersionPrintsTheLinkedVersion(t *testing.T) {
+	out, err := newHarness(t).run(t, "--version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "aviary version dev\n" {
+		t.Errorf("aviary --version = %q, want the default dev version", out)
+	}
+
+	old := version
+	t.Cleanup(func() { version = old })
+	version = "1.2.3"
+	if out, _ := newHarness(t).run(t, "--version"); out != "aviary version 1.2.3\n" {
+		t.Errorf("aviary --version = %q, want the version set at link time", out)
+	}
+
+	// The version flag takes -v only on the root: down keeps it for --volumes.
+	down, _, err := newHarness(t).app.rootCmd().Find([]string{"down", "-v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := down.ParseFlags([]string{"-v"}); err != nil {
+		t.Fatal(err)
+	}
+	if volumes, _ := down.Flags().GetBool("volumes"); !volumes {
+		t.Error("aviary down -v did not set --volumes")
+	}
+}
+
 func TestTestHelpShowsHelp(t *testing.T) {
 	// Help needs no stack, so it runs outside any worktree.
 	t.Chdir(tempDir(t))

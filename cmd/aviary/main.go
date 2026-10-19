@@ -21,6 +21,10 @@ import (
 	"github.com/faradayio/aviary/internal/workspace"
 )
 
+// version is the release version, set at link time with
+// -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	err := newApp().rootCmd().Execute()
 	if err == nil {
@@ -61,6 +65,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "aviary",
 		Short:         "An isolated Docker Compose stack for every worktree",
+		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		// Parse aviary's own flags before the command name, so that
