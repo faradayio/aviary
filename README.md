@@ -136,9 +136,9 @@ them any other way, such as `aviary compose down -v`, leaves the stack marked
 initialized until `aviary init --force`. Checking that the volumes exist
 arrives with seeded snapshots.
 
-`aviary test` with no suite lists the suites. Because everything after the
-suite name belongs to the suite, `aviary test --help` is read as a suite
-called `--help`; use `aviary help test` instead.
+`aviary test` with no suite lists the suites, and `aviary test --help` or
+`aviary test -h` prints the command's help. Every argument after a suite name
+is passed to the suite, so `aviary test api --help` reaches the test runner.
 
 ### Profiles
 
