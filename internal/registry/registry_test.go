@@ -82,7 +82,8 @@ func TestAllocateIsStableAndFollowsTheNameList(t *testing.T) {
 	if changed.Ports["postgres"] != first.Ports["postgres"] {
 		t.Error("postgres should keep its port when the list changes")
 	}
-	// The port redis gave up is the lowest free one, so api takes it.
+	// The port redis gave up is the first free one from the project's base, so
+	// api takes it.
 	if changed.Ports["api"] != first.Ports["redis"] {
 		t.Errorf("api = %d, want the released redis port %d", changed.Ports["api"], first.Ports["redis"])
 	}

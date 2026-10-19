@@ -194,7 +194,9 @@ Run from anywhere inside a worktree.
   directory no longer exists, and releases their ports.
 - `aviary rm [--project <name>]` removes this worktree's stack, or the named
   one, with its volumes, and releases its ports. A later command that starts
-  the stack, or `aviary env`, registers it again with new ports.
+  the stack, or `aviary env`, registers it again; allocation starts again at
+  the block derived from the project name (see [Ports](#ports)), so it gets the
+  same ports back unless they have been taken since.
 
 No command prompts. aviary's own errors go to stderr as `aviary: <message>`
 with exit status 1.

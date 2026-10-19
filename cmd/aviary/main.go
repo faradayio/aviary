@@ -400,7 +400,9 @@ func (a *app) rmCmd() *cobra.Command {
 		Short: "Remove a stack with its volumes and release its ports",
 		Long: `Remove a stack's containers, networks and volumes, and release its host ports.
 Without --project, the stack is this worktree's. A later command that starts
-the stack, or aviary env, registers it again with newly allocated ports.`,
+the stack, or aviary env, registers it again; allocation starts again at the
+block derived from the project name, so it gets the same ports back unless they
+have been taken since.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := project
