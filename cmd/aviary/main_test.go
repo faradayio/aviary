@@ -139,6 +139,26 @@ func TestHelpListsEveryCommand(t *testing.T) {
 	}
 }
 
+func TestTestHelpShowsHelp(t *testing.T) {
+	// Help needs no stack, so it runs outside any worktree.
+	t.Chdir(tempDir(t))
+	for _, flag := range []string{"--help", "-h"} {
+		h := newHarness(t)
+		out, err := h.run(t, "test", flag)
+		if err != nil {
+			t.Fatalf("aviary test %s: %v", flag, err)
+		}
+		for _, want := range []string{"test [suite [-- args...]]", "Run a named test suite from aviary.yml."} {
+			if !strings.Contains(out, want) {
+				t.Errorf("aviary test %s output lacks %q:\n%s", flag, want, out)
+			}
+		}
+		if len(h.composed) != 0 {
+			t.Errorf("aviary test %s ran compose: %v", flag, h.composed)
+		}
+	}
+}
+
 func TestUnknownCommandFails(t *testing.T) {
 	_, err := newHarness(t).run(t, "bogus")
 	if err == nil || !strings.Contains(err.Error(), `unknown command "bogus"`) {

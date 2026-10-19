@@ -180,8 +180,13 @@ are started and waited on, and the suite's command runs in a fresh container
 with any extra args appended. The exit status is the suite's own.
 
 With no suite, list the suites aviary.yml defines.`,
+		// Arguments after the suite name go to the suite's command, so cobra
+		// parses no flags here, including its own help flag.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+				return cmd.Help()
+			}
 			// Listing suites starts nothing, so it neither needs require_env
 			// nor registers the stack.
 			opts := startsContainers
