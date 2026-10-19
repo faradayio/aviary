@@ -422,19 +422,26 @@ differs from its key; the error names the file and the entry to fix or delete.
 
 aviary refuses a registry file it cannot trust, and the error names the file:
 
-- `registry version <n> is not supported`: a newer aviary wrote the file.
-  Upgrade aviary; an older one never overwrites a newer file.
+- `registry version <n> is not supported`: when `<n>` is higher than the
+  version the error says this aviary reads, a newer aviary wrote the file.
+  Upgrade aviary; an older one never overwrites a newer file. Otherwise the
+  `version` key was removed (the error then says version `0`) or edited by
+  hand: restore `"version": 1` at the top level of the file.
 - A JSON parse error: the file was edited by hand. Fix the JSON.
 - `entry "<key>" has project "<name>"`: set the entry's `project` to its key,
   or delete the entry.
 
 Deleting an entry, or the whole file, makes aviary forget those stacks without
-removing them. Their containers and volumes stay: `docker compose ls --all`
-lists them (their names start with `aviary-`), and
-`docker compose --project-name <project> down --volumes` removes one. A
-forgotten stack whose worktree still exists is registered again by the next
-command that starts it, marked uninitialized, so init runs again over the data
-its volumes still hold; run `aviary down --volumes` first to start clean.
+removing them. Their containers and volumes stay, and their names start with
+`aviary-`. `docker compose ls --all` lists only stacks that still have
+containers; a forgotten stack that was already down has only volumes, which
+`docker volume ls --filter name=aviary-` lists (or
+`docker volume ls --filter label=com.docker.compose.project=<project>` for one
+stack). `docker compose --project-name <project> down --volumes` removes a
+forgotten stack's containers and volumes either way. A forgotten stack whose
+worktree still exists is registered again by the next command that starts it,
+marked uninitialized, so init runs again over the data its volumes still hold;
+run `aviary down --volumes` first to start clean.
 
 ### Port already allocated
 
