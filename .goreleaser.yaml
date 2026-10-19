@@ -1,5 +1,5 @@
 # Builds aviary for macOS and Linux and publishes a GitHub release and a
-# Homebrew formula. The release workflow runs this on every v* tag; locally,
+# Homebrew cask. The release workflow runs this on every v* tag; locally,
 # `goreleaser release --snapshot --clean` builds everything into dist/
 # without publishing.
 version: 2

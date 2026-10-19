@@ -24,9 +24,6 @@ With Homebrew on macOS:
 brew install faradayio/tap/aviary
 ```
 
-The tap and the releases page are filled in by the first tagged release;
-until then, use `go install`.
-
 With Go 1.27.1 or later (prints `dev` for `aviary --version`):
 
 ```sh
