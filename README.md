@@ -498,12 +498,18 @@ Docker Desktop runs every container in one Linux virtual machine, so its
 settings decide how fast each stack runs and how many fit. These are the
 settings that matter; all are under Settings in the Docker Desktop menu.
 
+- **General, "Virtual Machine Manager": Apple Virtualization framework.**
+  Docker Desktop offers Docker VMM, the Apple Virtualization framework and,
+  in older versions, QEMU. Docker VMM starts faster and returns idle memory
+  to the host, but Docker's documentation states that it does not support
+  Rosetta, so any `linux/amd64` image runs under slow emulation. Choose the
+  Apple Virtualization framework whenever your images are amd64-only.
 - **General, "Use Rosetta for x86_64/amd64 emulation on Apple Silicon": on.**
   Any image built only for `linux/amd64` runs emulated on an Apple silicon
   Mac. With this off, Docker uses QEMU: single-threaded workloads run several
   times slower, suites fail on their own timeouts, and processes that JIT
-  heavily can crash with signal 11. This needs the Apple Virtualization
-  framework, selected under General, "Virtual Machine Manager".
+  heavily can crash with signal 11. The option is only offered with the Apple
+  Virtualization framework selected above.
 - **General, file sharing implementation: VirtioFS.** aviary stacks bind-mount
   the worktree's sources, so the file-sharing layer is on the path of every
   source read.
