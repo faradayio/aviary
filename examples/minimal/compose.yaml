@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "${AVIARY_PORT_POSTGRES:-5432}:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "${AVIARY_PORT_REDIS:-6379}:6379"
+
+  # A client with psql on it, for init steps and suites. depends_on is what
+  # makes `aviary run client ...` start postgres first and wait for health.
+  client:
+    image: postgres:17-alpine
+    entrypoint: []
+    command: ["sleep", "infinity"]
+    # sleep ignores SIGTERM as PID 1; an init process lets down stop it at once.
+    init: true
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      AVIARY_PROJECT: ${AVIARY_PROJECT:-unset}
+    volumes:
+      - .:/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres: {}

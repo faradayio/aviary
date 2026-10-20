@@ -1,0 +1,22 @@
+# A minimal aviary stack: Postgres, Redis and a psql client. Run any aviary
+# command from this directory, e.g. `aviary test db`.
+compose:
+  files:
+    - compose.yaml
+ports:
+  - postgres
+  - redis
+init:
+  - service: client
+    command: [psql, -c, "CREATE TABLE seeded (id int); INSERT INTO seeded VALUES (1), (2);"]
+suites:
+  # Prints the number of rows init seeded.
+  db:
+    service: client
+    needs: [postgres]
+    command: [psql, -tAc, "SELECT count(*) FROM seeded"]
+  # Runs a shell snippet given after --, e.g. aviary test smoke -- 'echo $AVIARY_PROJECT'.
+  smoke:
+    service: client
+    init: false
+    command: [sh, -c]

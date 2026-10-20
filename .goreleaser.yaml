@@ -1,0 +1,52 @@
+# Builds aviary for macOS and Linux and publishes a GitHub release and a
+# Homebrew cask. The release workflow runs this on every v* tag; locally,
+# `goreleaser release --snapshot --clean` builds everything into dist/
+# without publishing.
+version: 2
+
+project_name: aviary
+
+builds:
+  - main: ./cmd/aviary
+    binary: aviary
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+
+# GoReleaser publishes Homebrew packages as casks (its formula generator is
+# deprecated), so the tap holds Casks/aviary.rb and
+# `brew install faradayio/tap/aviary` installs it.
+homebrew_casks:
+  - name: aviary
+    repository:
+      owner: faradayio
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/faradayio/aviary
+    description: An isolated Docker Compose stack for every worktree
+    # The binaries are not notarized, so clear the quarantine flag that
+    # would otherwise make macOS refuse to run a downloaded one.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/aviary"]
+          end
+    # Push to the tap only when the token is set, and never for a prerelease
+    # tag (auto), so the GitHub release succeeds without the tap.
+    skip_upload: '{{ if index .Env "HOMEBREW_TAP_GITHUB_TOKEN" }}auto{{ else }}true{{ end }}'
