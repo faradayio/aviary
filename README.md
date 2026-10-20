@@ -14,6 +14,56 @@ Everything else is plain compose. aviary adds no runtime, daemon or compose
 dialect, writes nothing into the worktree, and your compose files keep working
 without it.
 
+## Why aviary
+
+**What it is.** A small command-line tool over `docker compose`. It reads an
+`aviary.yml` that names the compose files, the host ports, the init steps and
+the test suites of a repository, and runs compose with a project name and a
+port set that are unique to the worktree you are in.
+
+**Why it exists.** Development at Faraday moved from one checkout per person
+to many worktrees per machine, most of them driven by coding agents. Each
+worktree needs a stack of its own so that agents can run test suites, model
+training and integration tests side by side without one worktree's database
+or ports clobbering another's. Our previous tool, [cage](https://github.com/faradayio/cage),
+assumes one checkout per machine: it generates compose files into the
+checkout and publishes fixed host ports, so a second worktree either collides
+with the first or has to be started by hand with different settings.
+
+**What it does about it.** Every worktree gets its own compose project, its
+own named volumes and its own host ports, derived from the worktree's path and
+recorded in a registry under `~/.local/state`. Suites and init steps are named
+once in `aviary.yml` and run with `aviary test <suite>` and `aviary init` from
+any worktree. `aviary ls` shows every stack on the machine and `aviary gc`
+removes the ones whose worktrees are gone.
+
+**Differences from cage.**
+
+| cage                                                | aviary                                                                          |
+| --------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Generates compose files from its own format         | Runs your hand-written compose files as they are; generates nothing             |
+| One stack per machine, fixed host ports             | One stack per worktree, a port set per worktree                                 |
+| Writes into the checkout (`pods/`, mounted sources) | Writes nothing into the worktree; sources are bind-mounted by your compose file |
+| Pods, targets and overlays                          | Compose profiles and extra compose files                                        |
+| Mints a Vault token per service                     | Checks that the variables in `require_env` are set and passes them through      |
+| Build and deploy path for production                | Local development and testing only                                              |
+
+cage remains the deploy tool. aviary replaces it only for running a repository
+locally, so a repository can carry both.
+
+**Why Go.** Docker and Compose are written in Go, so the compose
+specification parser is an import away if aviary ever needs to read compose
+files in-process rather than shelling out. The standard library covers the
+rest of what aviary does (file locks, JSON, subprocesses, port probes), which
+keeps the dependency list to a CLI framework, a YAML parser and a file lock.
+A static binary per platform, a Homebrew cask and a release pipeline were an
+afternoon's work with goreleaser. Forking cage would have meant keeping the
+compose generation that causes the collisions in the first place, and the
+per-worktree parts aviary needed are about two thousand lines, smaller than
+cage's internals. Rust's strengths, performance and memory safety under
+concurrency, are not the constraint: aviary spends its time waiting on
+`docker compose`.
+
 ## Install
 
 aviary needs Docker with Compose v2.
@@ -375,7 +425,8 @@ worktree until `git worktree prune`.
 
 ## Coming from a compose wrapper
 
-A per-checkout compose wrapper usually merges its compose files into
+A per-checkout compose wrapper such as [cage](https://github.com/faradayio/cage)
+usually merges its compose files into
 generated ones inside the checkout, publishes fixed host ports, and offers
 verbs over `docker compose`. aviary keeps the compose files as they are,
 generates nothing, gives every worktree its own ports, and maps the usual
