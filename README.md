@@ -89,6 +89,76 @@ Or download the archive for your platform from the
 
 `aviary --version` prints the installed version.
 
+## Docker Desktop settings
+
+aviary runs whatever Docker you have. On macOS that is Docker Desktop, which
+runs every container in one Linux virtual machine, and its settings decide
+how fast each stack runs and how many fit on the machine. Set these once,
+under Settings in the Docker Desktop menu, before the first `aviary up`.
+
+### Preferred setup
+
+| Setting                                                          | Choose                                   |
+| ---------------------------------------------------------------- | ---------------------------------------- |
+| General, Virtual Machine Manager                                 | Apple Virtualization framework           |
+| General, Use Rosetta for x86_64/amd64 emulation on Apple Silicon | On                                       |
+| General, file sharing implementation                             | VirtioFS                                 |
+| Resources, Memory                                                | Sum of the stacks you run at once + 2 GB |
+| Resources, CPUs                                                  | All but two of the machine's cores       |
+| Resources, Disk image size                                       | Images + one database per worktree       |
+| Shell startup files                                              | No `DOCKER_DEFAULT_PLATFORM`             |
+
+Apply, let Docker Desktop restart, then check the two that matter most:
+
+```sh
+docker info --format '{{.MemTotal}}'   # the VM's memory, in bytes
+docker run --rm --platform linux/amd64 alpine uname -m   # x86_64: emulation works
+```
+
+### Why each option
+
+- **Virtual Machine Manager: Apple Virtualization framework.** Docker Desktop
+  offers Docker VMM, the Apple Virtualization framework and, in older
+  versions, QEMU. Docker VMM starts faster and returns idle memory to the
+  host, but Docker's documentation states that it does not support Rosetta,
+  so every `linux/amd64` image runs under slow emulation. Choose the Apple
+  Virtualization framework whenever any of your images is amd64-only, which
+  is the case for most application images built by CI on amd64 runners.
+- **Rosetta: on.** Any image built only for `linux/amd64` runs emulated on an
+  Apple silicon Mac. With Rosetta off, Docker uses QEMU: single-threaded
+  workloads run several times slower, suites fail on their own timeouts, and
+  processes that JIT heavily can crash with signal 11. The option is only
+  offered with the Apple Virtualization framework selected.
+- **File sharing: VirtioFS.** aviary stacks bind-mount the worktree's sources,
+  so the file-sharing layer is on the path of every source read. VirtioFS is
+  the fast option; gRPC FUSE is the fallback.
+- **Memory.** The one limit every stack shares; see
+  [Running out of memory](#running-out-of-memory). Size it for the stacks
+  you run at once, not for the machine: a lean stack of databases and caches
+  costs a few hundred megabytes, a full application stack or a heavy suite
+  costs gigabytes, and the host still needs its own share. Measure with
+  `docker stats`, then set the VM to the sum plus headroom. Raising the VM
+  above half the machine's memory starves the host.
+- **CPUs.** Emulated processes are the slow ones and they benefit most from
+  cores, so give the VM most of them.
+- **Disk image size.** Each worktree has its own named volumes, so the disk
+  fills with one database per stack plus the images. `aviary gc` removes
+  stacks whose worktrees are gone; `docker system df` shows the rest.
+- **`DOCKER_DEFAULT_PLATFORM`.** Remove `DOCKER_DEFAULT_PLATFORM=linux/amd64`
+  from `~/.zshrc` or `~/.bashrc` if it is set. It forces multi-arch images
+  such as Postgres and Redis to run emulated too, which costs speed for
+  nothing.
+- **Resource Saver** can stay on. It stops the VM when idle and restarts it
+  on the next container, which adds a few seconds to the first command after
+  a pause.
+
+Keep Docker Desktop current: the Rosetta option, VirtioFS and the Apple
+Virtualization framework are all recent additions, and Docker VMM is still
+changing.
+
+On Linux there is no VM: containers use the host's memory and CPUs directly,
+and amd64 images run natively on an amd64 host.
+
 ## Set up a repository
 
 Put an `aviary.yml` next to your compose files:
