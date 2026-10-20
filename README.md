@@ -492,6 +492,39 @@ A relative `XDG_STATE_HOME` is ignored. aviary refuses a registry file whose
 `version` it does not read, or with an entry whose `project` is missing or
 differs from its key; the error names the file and the entry to fix or delete.
 
+## Docker Desktop on macOS
+
+Docker Desktop runs every container in one Linux virtual machine, so its
+settings decide how fast each stack runs and how many fit. These are the
+settings that matter; all are under Settings in the Docker Desktop menu.
+
+- **General, "Use Rosetta for x86_64/amd64 emulation on Apple Silicon": on.**
+  Any image built only for `linux/amd64` runs emulated on an Apple silicon
+  Mac. With this off, Docker uses QEMU: single-threaded workloads run several
+  times slower, suites fail on their own timeouts, and processes that JIT
+  heavily can crash with signal 11. This needs the Apple Virtualization
+  framework, selected under General, "Virtual Machine Manager".
+- **General, file sharing implementation: VirtioFS.** aviary stacks bind-mount
+  the worktree's sources, so the file-sharing layer is on the path of every
+  source read.
+- **Resources, Memory.** The one limit every stack shares; see
+  [Running out of memory](#running-out-of-memory). Size it for the stacks you
+  run at once, not for the machine: a lean stack of databases and caches
+  costs a few hundred megabytes, a full application stack or a heavy suite
+  costs gigabytes, and the host still needs its own share. Measure with
+  `docker stats`, then set the VM to the sum plus headroom.
+- **Resources, CPUs.** Give the VM most of the machine's cores. Emulated
+  processes are the slow ones, and they benefit most.
+- **Resources, Disk image size.** Each worktree has its own named volumes, so
+  the disk fills with one database per stack plus the images. `aviary gc`
+  removes stacks whose worktrees are gone; `docker system df` shows the rest.
+- **Shell startup files.** Remove `DOCKER_DEFAULT_PLATFORM=linux/amd64` if it
+  is set. It forces multi-arch images such as Postgres and Redis to run
+  emulated too, which costs speed for nothing.
+
+Keep Docker Desktop current: the Rosetta option, VirtioFS and the
+Virtualization framework are all recent additions.
+
 ## Troubleshooting
 
 ### Registry file errors
