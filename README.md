@@ -159,10 +159,14 @@ steps succeed. A failing step stops the sequence, names the step, and leaves
 the stack uninitialized with the partial data kept for inspection.
 `aviary down --volumes` and `aviary rm` discard the data so init runs again
 next time; `aviary init --force` reruns the steps against the current data.
-aviary records that init has run rather than checking the volumes, so removing
-them any other way, such as `aviary compose down -v`, leaves the stack marked
-initialized until `aviary init --force`. Checking that the volumes exist
-arrives with seeded snapshots.
+aviary records in its registry that init has run rather than checking the
+volumes, so removing them any other way, such as `aviary compose down -v`,
+leaves the stack marked initialized until `aviary init --force`.
+
+Each worktree's stack has its own volumes, so a new worktree runs every init
+step from scratch, however many other worktrees of the repository are already
+initialized. `aviary.yml` also accepts `snapshot` and `after_restore` keys;
+aviary does not act on them.
 
 `aviary test` with no suite lists the suites, and `aviary test --help` or
 `aviary test -h` prints the command's help. Every argument after a suite name
@@ -188,13 +192,6 @@ suites:
 Stack-wide profiles are passed as `--profile` to every compose call. A
 suite's profiles are added to both of its calls: the `up` of its needs and the
 `run` of its command.
-
-## Seeded snapshots (coming)
-
-Caching seeded volumes and restoring them into new worktrees instead of
-running init is planned. `aviary.yml` already accepts the `snapshot` and
-`after_restore` keys so definitions written now keep working, but aviary does
-not act on them yet: init always runs its steps.
 
 ## Commands
 
@@ -513,37 +510,6 @@ stack or several lean ones. Within a stack, start more only when needed:
 A memory limit in a compose file (`deploy.resources.limits.memory`) caps one
 service, so a runaway service is killed on its own instead of starving every
 stack.
-
-### A second stack for a worktree whose slug starts with `aviary-`
-
-aviary once put its `aviary-` prefix in front of every slug, so a worktree
-named `aviary-test-1` got the project `aviary-aviary-test-1-<hash>`. It now
-leaves a slug that already starts with `aviary-` alone (see
-[How isolation works](#how-isolation-works)). The slug lower-cases the
-directory name and turns every other character into `-`, so this covers a
-worktree named `aviary`, or `aviary` followed by any character other than a
-letter or digit: `aviary-test-1`, `aviary.` and `Aviary_tools` all qualify.
-
-A stack created under the doubled name no longer belongs to its worktree.
-Every command there addresses the new project name instead:
-
-- `aviary ps`, `logs`, `exec` and `down` act on the new project, which has no
-  containers. `down` therefore leaves the old stack running and holding its
-  ports.
-- `aviary env`, and any command that starts the stack, registers the new
-  project with ports of its own. `up` then starts an empty stack; init has
-  not run for it, so run `aviary init`, or the next `aviary test` of a suite
-  that has init runs the init steps.
-
-`aviary ls` lists the old stack under its doubled name, with this worktree as
-its root. Remove it by that name first, which also removes its volumes and
-releases its ports, then start again:
-
-```sh
-aviary rm --project aviary-aviary-test-1-<hash>
-aviary up
-aviary init
-```
 
 ## Development
 
