@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/faradayio/aviary/internal/compose"
 	"github.com/faradayio/aviary/internal/config"
@@ -84,6 +85,15 @@ func (h *harness) register(t *testing.T, project, root, config string, ports ...
 	}
 }
 
+func (h *harness) entry(t *testing.T, project string) registry.Entry {
+	t.Helper()
+	e, ok, err := h.reg.Get(project)
+	if err != nil || !ok {
+		t.Fatalf("registry entry %s: found %v, err %v", project, ok, err)
+	}
+	return e
+}
+
 func (h *harness) projectNames(t *testing.T) []string {
 	t.Helper()
 	entries, err := h.reg.List()
@@ -100,7 +110,7 @@ func (h *harness) projectNames(t *testing.T) []string {
 // basePort is the port a fresh registry hands the first port name of the
 // stack rooted at root, as a string.
 func basePort(root string) string {
-	return strconv.Itoa(registry.BasePort(workspace.ProjectPrefix + workspace.Slug(root)))
+	return strconv.Itoa(registry.BasePort(workspace.Workspace{Slug: workspace.Slug(root)}.Project()))
 }
 
 func tempDir(t *testing.T) string {
@@ -226,18 +236,30 @@ func TestLsJSONJoinsRegistryWithComposeStatus(t *testing.T) {
 		t.Fatalf("ls --json is not a JSON array: %v\n%s", err, out)
 	}
 	base := registry.BasePort("aviary-live-111111")
+	gone, live := h.entry(t, "aviary-gone-222222"), h.entry(t, "aviary-live-111111")
 	want := []map[string]any{
 		{
 			"project": "aviary-gone-222222", "status": "down", "root": "/nonexistent/aviary-test/gone",
 			"branch": "", "worktree_missing": true, "initialized": false,
+			"created_at": gone.CreatedAt.Format(time.RFC3339Nano), "initialized_at": nil,
 			"ports": map[string]any{}, "config": "/defs/myrepo",
 		},
 		{
 			"project": "aviary-live-111111", "status": "running(2)", "root": liveRoot,
 			"branch": "branch-of-" + filepath.Base(liveRoot), "worktree_missing": false, "initialized": true,
+			"created_at": live.CreatedAt.Format(time.RFC3339Nano), "initialized_at": live.InitializedAt.Format(time.RFC3339Nano),
 			"ports":  map[string]any{"postgres": float64(base), "redis": float64(base + 1)},
 			"config": "in-tree",
 		},
+	}
+	for _, row := range rows {
+		for _, key := range []string{"created_at", "initialized_at"} {
+			if v, ok := row[key].(string); ok {
+				if _, err := time.Parse(time.RFC3339, v); err != nil {
+					t.Errorf("%s %s = %q is not RFC 3339: %v", row["project"], key, v, err)
+				}
+			}
+		}
 	}
 	got, _ := json.Marshal(rows)
 	exp, _ := json.Marshal(want)
@@ -418,7 +440,7 @@ func TestRmWithoutProjectFailsForAnUnregisteredWorktree(t *testing.T) {
 	h := newHarness(t)
 
 	_, err := h.run(t, "rm")
-	if err == nil || !strings.Contains(err.Error(), workspace.ProjectPrefix+workspace.Slug(root)) {
+	if err == nil || !strings.Contains(err.Error(), workspace.Workspace{Slug: workspace.Slug(root)}.Project()) {
 		t.Fatalf("rm in an unregistered worktree: error = %v, want one naming its project", err)
 	}
 	if len(h.downed) != 0 {
@@ -439,7 +461,7 @@ suites:
 
 	// down is left out: its compose call is not behind the app seam, so it
 	// would run docker. The stack tests cover Down on an unregistered stack.
-	for _, args := range [][]string{{"ps"}, {"logs", "app"}, {"test"}} {
+	for _, args := range [][]string{{"ps"}, {"logs"}, {"logs", "app"}, {"exec", "web", "ls"}, {"test"}} {
 		if _, err := h.run(t, args...); err != nil {
 			t.Fatalf("aviary %s: %v", strings.Join(args, " "), err)
 		}
@@ -447,8 +469,8 @@ suites:
 			t.Fatalf("aviary %s wrote the registry (stat err %v)", strings.Join(args, " "), err)
 		}
 	}
-	if len(h.composed) != 2 {
-		t.Fatalf("compose calls = %v, want ps and logs through the passthrough", h.composed)
+	if len(h.composed) != 4 {
+		t.Fatalf("compose calls = %v, want ps, logs twice and exec through the passthrough", h.composed)
 	}
 	if port, ok := h.composed[0].stack.Env["AVIARY_PORT_POSTGRES"]; ok {
 		t.Errorf("ps on an unregistered stack set AVIARY_PORT_POSTGRES=%s, want it unset", port)
@@ -485,7 +507,7 @@ func TestEnvExportAndJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 || !slices.Contains(lines, "export AVIARY_PORT_POSTGRES='"+port+"'") {
+	if len(lines) != 6 || !slices.Contains(lines, "export AVIARY_PORT_POSTGRES='"+port+"'") {
 		t.Errorf("env --export =\n%s", out)
 	}
 	for _, line := range lines {
@@ -518,7 +540,7 @@ func TestEnvExportAndJSON(t *testing.T) {
 		t.Fatalf("env --json is not a JSON object of strings: %v\n%s", err, out)
 	}
 	keys := slices.Sorted(maps.Keys(env))
-	if want := []string{"AVIARY_PORT_POSTGRES", "AVIARY_PROJECT", "AVIARY_ROOT", "AVIARY_SLUG", "COMPOSE_PROJECT_NAME"}; !slices.Equal(keys, want) {
+	if want := []string{"AVIARY_CONFIG_DIR", "AVIARY_PORT_POSTGRES", "AVIARY_PROJECT", "AVIARY_ROOT", "AVIARY_SLUG", "COMPOSE_PROJECT_NAME"}; !slices.Equal(keys, want) {
 		t.Errorf("env --json keys = %v, want %v", keys, want)
 	}
 	if env["AVIARY_PORT_POSTGRES"] != port {
@@ -569,6 +591,37 @@ func TestConfigFlagWinsOverAviaryConfig(t *testing.T) {
 	}
 }
 
+func TestConfigDirIsTheDefinitionDirectory(t *testing.T) {
+	t.Run("in-tree", func(t *testing.T) {
+		root := tempDir(t)
+		writeDefinition(t, root, "compose: {files: [compose.yaml]}\n")
+		t.Chdir(root)
+		h := newHarness(t)
+		if env := envJSON(t, h, "env", "--json"); env["AVIARY_CONFIG_DIR"] != root {
+			t.Errorf("env AVIARY_CONFIG_DIR = %q, want the worktree root %s", env["AVIARY_CONFIG_DIR"], root)
+		}
+		if _, err := h.run(t, "up"); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.composed[0].stack.Env["AVIARY_CONFIG_DIR"]; got != root {
+			t.Errorf("compose env AVIARY_CONFIG_DIR = %q, want the worktree root %s", got, root)
+		}
+	})
+	t.Run("external", func(t *testing.T) {
+		_, fromFlag := externalDefinitions(t)
+		h := newHarness(t)
+		if env := envJSON(t, h, "--config", fromFlag, "env", "--json"); env["AVIARY_CONFIG_DIR"] != fromFlag || env["AVIARY_ROOT"] == fromFlag {
+			t.Errorf("env = %v, want AVIARY_CONFIG_DIR %s apart from AVIARY_ROOT", env, fromFlag)
+		}
+		if _, err := h.run(t, "--config", fromFlag, "up"); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.composed[0].stack.Env["AVIARY_CONFIG_DIR"]; got != fromFlag {
+			t.Errorf("compose env AVIARY_CONFIG_DIR = %q, want the definition directory %s", got, fromFlag)
+		}
+	})
+}
+
 func TestPassthroughTakesConfigBeforeTheCommandName(t *testing.T) {
 	_, fromFlag := externalDefinitions(t)
 	h := newHarness(t)
@@ -599,12 +652,12 @@ suites:
 	t.Setenv("AVIARY_TEST_MISSING", "")
 	t.Chdir(root)
 
-	for _, args := range [][]string{{"ps"}, {"logs", "app"}, {"env"}, {"test"}} {
+	for _, args := range [][]string{{"ps"}, {"logs"}, {"logs", "app"}, {"exec", "web", "ls"}, {"env"}, {"test"}} {
 		if _, err := newHarness(t).run(t, args...); err != nil {
 			t.Errorf("aviary %s failed on a missing require_env name: %v", strings.Join(args, " "), err)
 		}
 	}
-	for _, args := range [][]string{{"up"}, {"run", "app"}, {"exec", "app", "sh"}, {"build"}, {"compose", "config"}, {"init"}, {"test", "unit"}} {
+	for _, args := range [][]string{{"up"}, {"run", "app"}, {"build"}, {"compose", "config"}, {"init"}, {"test", "unit"}} {
 		h := newHarness(t)
 		_, err := h.run(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "AVIARY_TEST_MISSING") {

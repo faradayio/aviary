@@ -1,13 +1,16 @@
 package stack
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -64,6 +67,7 @@ func newStack(t *testing.T, cfg *config.Config) (*Stack, *recorder) {
 		Entry:     entry,
 		registry:  reg,
 		runner:    rec.run,
+		stderr:    io.Discard,
 	}
 	return s, rec
 }
@@ -310,6 +314,7 @@ func TestEnvNamesTheStackAndEveryPort(t *testing.T) {
 		"AVIARY_PROJECT":        "aviary-wt-abc123",
 		"AVIARY_SLUG":           "wt-abc123",
 		"AVIARY_ROOT":           "/work/wt",
+		"AVIARY_CONFIG_DIR":     "/work/wt",
 		"AVIARY_PORT_POSTGRES":  port(0),
 		"AVIARY_PORT_REDIS":     port(1),
 		"AVIARY_PORT_WEB_HTTPS": port(2),
@@ -399,6 +404,53 @@ func TestInitRunsStepsInOrderThenMarksInitialized(t *testing.T) {
 	}
 	if len(rec.calls) != 3 {
 		t.Errorf("Init(true) made %d compose calls, want the 3 steps again", len(rec.calls))
+	}
+}
+
+func TestInitReportsEachStepsTimeAndTheTotal(t *testing.T) {
+	s, _ := newStack(t, initConfig())
+	var stderr bytes.Buffer
+	s.stderr = &stderr
+
+	if err := s.Init(false); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`aviary: init: api rake db:reset`,
+		`aviary: init: step 1/3 ok \d+\.\ds`,
+		`aviary: init: worker bin/worker seed`,
+		`aviary: init: step 2/3 ok \d+\.\ds`,
+		`aviary: init: api psql -f reference.sql`,
+		`aviary: init: step 3/3 ok \d+\.\ds`,
+		`aviary: init: total \d+\.\ds`,
+	}
+	lines := strings.Split(strings.TrimSuffix(stderr.String(), "\n"), "\n")
+	if len(lines) != len(want) {
+		t.Fatalf("init printed %d lines, want %d:\n%s", len(lines), len(want), stderr.String())
+	}
+	for i, pattern := range want {
+		if !regexp.MustCompile("^" + pattern + "$").MatchString(lines[i]) {
+			t.Errorf("line %d = %q, want it to match %q", i+1, lines[i], pattern)
+		}
+	}
+}
+
+func TestInitReportsNoTimesAfterAFailingStep(t *testing.T) {
+	s, rec := newStack(t, initConfig())
+	var stderr bytes.Buffer
+	s.stderr = &stderr
+	rec.fail = func(args []string) error {
+		if slices.Contains(args, "worker") {
+			return &compose.ExitError{Code: 2}
+		}
+		return nil
+	}
+
+	if err := s.Init(false); err == nil {
+		t.Fatal("expected the failing step to fail Init")
+	}
+	if got := stderr.String(); strings.Contains(got, "step 2/3 ok") || strings.Contains(got, "total") {
+		t.Errorf("init reported success past the failing step:\n%s", got)
 	}
 }
 

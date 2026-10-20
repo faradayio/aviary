@@ -31,6 +31,25 @@ func TestSlugIsComposeSafeAndDistinctPerPath(t *testing.T) {
 	}
 }
 
+func TestProjectPrefixesTheSlugOnce(t *testing.T) {
+	for _, root := range []string{"/work/wt-a", "/work/aviary-test-1", "/work/Aviary-Test-1", "/work/aviary", "/work/aviaryish"} {
+		slug := Slug(root)
+		want := ProjectPrefix + slug
+		if strings.HasPrefix(slug, ProjectPrefix) {
+			want = slug
+		}
+		if got := (Workspace{Root: root, Slug: slug}).Project(); got != want {
+			t.Errorf("Project() for %s = %q, want %q", root, got, want)
+		}
+	}
+	if got, want := (Workspace{Slug: Slug("/work/aviary-test-1")}).Project(), "aviary-test-1-"; !strings.HasPrefix(got, want) {
+		t.Errorf("Project() for a basename starting with %q = %q, want it to start with %q", ProjectPrefix, got, want)
+	}
+	if got, want := (Workspace{Slug: Slug("/work/aviaryish")}).Project(), "aviary-aviaryish-"; !strings.HasPrefix(got, want) {
+		t.Errorf("Project() for a basename starting with aviary but not %q = %q, want it to start with %q", ProjectPrefix, got, want)
+	}
+}
+
 // isolate keeps git from discovering a repository above dir, so tests behave
 // the same wherever the temp directory lives.
 func isolate(t *testing.T, dir string) {

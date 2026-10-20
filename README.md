@@ -79,8 +79,8 @@ or `aviary gc`.
 require_env: [VAULT_TOKEN]
 ```
 
-Commands that start or run containers (`up`, `test`, `init`, `run`, `exec`,
-`build`, `compose`) refuse to start, listing every missing name, when any of
+Commands that start or run containers (`up`, `test`, `init`, `run`, `build`,
+`compose`) refuse to start, listing every missing name, when any of
 these variables is unset or empty. The host environment passes through to
 compose, so the compose files can interpolate them.
 
@@ -105,7 +105,17 @@ aviary up
 
 Either way, compose file paths in `aviary.yml` are relative to the definition
 directory, and compose's project directory is the worktree root, so bind
-mounts and `env_file` paths resolve against the worktree.
+mounts and `env_file` paths resolve against the worktree. A compose file
+reaches files kept next to the definition through `AVIARY_CONFIG_DIR`, which
+aviary sets to the definition directory alongside `AVIARY_ROOT`, the worktree
+root:
+
+```yaml
+services:
+  postgres:
+    volumes:
+      - ${AVIARY_CONFIG_DIR}/support/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+```
 
 `--config` is a flag of `aviary` itself, so it goes before the command name:
 `aviary --config ~/stacks/myrepo up`.
@@ -144,8 +154,9 @@ Arguments after `--` are appended to the suite's command, so
 `aviary test api -- --grep users` reaches the test runner. aviary exits with
 the suite's own status. A suite with `init: false` skips step 1.
 
-Init runs once per stack. A failing step stops the sequence, names the step,
-and leaves the stack uninitialized with the partial data kept for inspection.
+Init runs once per stack. Each step's time and the total go to stderr as the
+steps succeed. A failing step stops the sequence, names the step, and leaves
+the stack uninitialized with the partial data kept for inspection.
 `aviary down --volumes` and `aviary rm` discard the data so init runs again
 next time; `aviary init --force` reruns the steps against the current data.
 aviary records that init has run rather than checking the volumes, so removing
@@ -199,6 +210,8 @@ Run from anywhere inside a worktree.
 - `aviary run <service> [command...]` runs a one-off command in a fresh
   container and exits with its status.
 - `aviary exec <service> <command...>` runs a command in a running container.
+  Like `ps`, `logs` and `down`, it neither checks `require_env` nor registers
+  the stack.
 - `aviary ps`, `aviary logs` and `aviary build` pass through to the compose
   subcommand of the same name; `aviary compose <args...>` runs any compose
   subcommand. The stack's project, directory, files, profiles and ports are
@@ -226,8 +239,9 @@ with exit status 1.
 | ----------------------- | -------------------------------------------- |
 | `COMPOSE_PROJECT_NAME`  | the compose project name                     |
 | `AVIARY_PROJECT`        | the same project name                        |
-| `AVIARY_SLUG`           | the project name without the `aviary-` prefix |
+| `AVIARY_SLUG`           | the worktree's slug (see [How isolation works](#how-isolation-works)) |
 | `AVIARY_ROOT`           | the worktree root                            |
+| `AVIARY_CONFIG_DIR`     | the directory holding `aviary.yml`: the worktree root for an in-tree definition, else the external definition directory |
 | `AVIARY_PORT_<NAME>`    | the host port for each name in `ports`       |
 
 `aviary ls --json` prints an array with one object per stack:
@@ -240,6 +254,8 @@ with exit status 1.
 | `branch`           | string  | current git branch of the root, empty when unknown or detached           |
 | `worktree_missing` | boolean | the root no longer exists; `aviary gc` will remove the stack             |
 | `initialized`      | boolean | init has run since the stack was created or since aviary last removed its volumes (`down --volumes` or `rm`) |
+| `created_at`       | string  | when the stack was registered, RFC 3339, or `null` when the registry has no time |
+| `initialized_at`   | string  | when init last completed, RFC 3339, or `null` while `initialized` is false |
 | `ports`            | object  | port name to host port                                                   |
 | `config`           | string  | `in-tree`, or the external definition directory                          |
 
@@ -395,9 +411,10 @@ URL, does not follow the allocated port.
 The compose project name is `aviary-<slug>`, where the slug is the worktree
 root's directory name (lower-cased, other characters replaced by `-`, at most
 30 characters) followed by `-` and the first six hex digits of the SHA-1 of the
-root's full path. Two worktrees of one repository therefore never share
-containers, networks or named volumes, even when their directories have the
-same name.
+root's full path. When the slug already starts with `aviary-`, as for a
+worktree named `aviary-test-1`, the slug alone is the project name. Two
+worktrees of one repository therefore never share containers, networks or
+named volumes, even when their directories have the same name.
 
 Every compose call is
 `docker compose --project-name <project> --project-directory <root> --file ...`,
@@ -496,6 +513,22 @@ stack or several lean ones. Within a stack, start more only when needed:
 A memory limit in a compose file (`deploy.resources.limits.memory`) caps one
 service, so a runaway service is killed on its own instead of starving every
 stack.
+
+### A second stack for a worktree named `aviary-...`
+
+aviary once put its `aviary-` prefix in front of every slug, so a worktree
+named `aviary-test-1` got the project `aviary-aviary-test-1-<hash>`. It now
+leaves a slug that already starts with `aviary-` alone (see
+[How isolation works](#how-isolation-works)), so such a worktree's stack has a
+new name. A stack created under the doubled name is no longer this worktree's:
+the next command that starts the stack creates a new, empty one on new ports,
+and `aviary ls` lists both. Remove the old one by name, which also removes its
+volumes, and start again:
+
+```sh
+aviary rm --project aviary-aviary-test-1-<hash>
+aviary up
+```
 
 ## Development
 

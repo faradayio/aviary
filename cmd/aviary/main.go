@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -89,7 +90,7 @@ func (a *app) rootCmd() *cobra.Command {
 		a.testCmd(),
 		a.initCmd(),
 		a.passthrough("run <service> [command...]", "Run a one-off command in a fresh container", startsContainers, "run", "--rm"),
-		a.passthrough("exec <service> <command...>", "Run a command in a running container", startsContainers, "exec"),
+		a.passthrough("exec <service> <command...>", "Run a command in a running container", inspectsOnly, "exec"),
 		a.passthrough("ps", "List this stack's containers", inspectsOnly, "ps"),
 		a.passthrough("logs [service...]", "Show container logs", inspectsOnly, "logs"),
 		a.passthrough("build [service...]", "Build the stack's images", startsContainers, "build"),
@@ -115,9 +116,9 @@ func (a *app) configDir() string {
 var (
 	// startsContainers enforces require_env and allocates host ports.
 	startsContainers = stack.Options{}
-	// inspectsOnly is for commands that only look at or stop a stack: they
-	// hand no variables to a container and must not register a stack that
-	// was never started.
+	// inspectsOnly is for commands that only look at, stop or exec into a
+	// stack's existing containers: they create no container to hand
+	// variables to and must not register a stack that was never started.
 	inspectsOnly = stack.Options{SkipRequireEnv: true, NoAllocate: true}
 )
 
@@ -274,12 +275,15 @@ type stackRow struct {
 	Project string `json:"project"`
 	// Status is compose's status for the project, "down" when compose has
 	// no containers for it, or "unknown" when compose could not be asked.
-	Status          string         `json:"status"`
-	Root            string         `json:"root"`
-	Branch          string         `json:"branch"`
-	WorktreeMissing bool           `json:"worktree_missing"`
-	Initialized     bool           `json:"initialized"`
-	Ports           map[string]int `json:"ports"`
+	Status          string `json:"status"`
+	Root            string `json:"root"`
+	Branch          string `json:"branch"`
+	WorktreeMissing bool   `json:"worktree_missing"`
+	Initialized     bool   `json:"initialized"`
+	// CreatedAt and InitializedAt are null when the registry has no time.
+	CreatedAt     *time.Time     `json:"created_at"`
+	InitializedAt *time.Time     `json:"initialized_at"`
+	Ports         map[string]int `json:"ports"`
 	// Config is "in-tree" or the external definition directory.
 	Config string `json:"config"`
 }
@@ -327,12 +331,16 @@ func (a *app) rows(entries []registry.Entry, projects []compose.Project) []stack
 	rows := make([]stackRow, 0, len(entries))
 	for _, e := range entries {
 		row := stackRow{
-			Project:     e.Project,
-			Status:      status[e.Project],
-			Root:        e.Root,
-			Initialized: e.InitializedAt != nil,
-			Ports:       e.Ports,
-			Config:      e.Config,
+			Project:       e.Project,
+			Status:        status[e.Project],
+			Root:          e.Root,
+			Initialized:   e.InitializedAt != nil,
+			InitializedAt: e.InitializedAt,
+			Ports:         e.Ports,
+			Config:        e.Config,
+		}
+		if !e.CreatedAt.IsZero() {
+			row.CreatedAt = &e.CreatedAt
 		}
 		if row.Status == "" {
 			row.Status = "down"

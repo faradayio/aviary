@@ -37,8 +37,13 @@ type Workspace struct {
 	External bool
 }
 
-// Project is the compose project name for this workspace's stack.
+// Project is the compose project name for this workspace's stack: the slug
+// with ProjectPrefix in front, or the slug alone when the worktree's
+// basename already starts with the prefix, as in aviary-test-1.
 func (w Workspace) Project() string {
+	if strings.HasPrefix(w.Slug, ProjectPrefix) {
+		return w.Slug
+	}
 	return ProjectPrefix + w.Slug
 }
 

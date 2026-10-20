@@ -6,12 +6,14 @@ package stack
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/faradayio/aviary/internal/compose"
 	"github.com/faradayio/aviary/internal/config"
@@ -31,6 +33,8 @@ type Stack struct {
 	// runner runs one compose subcommand against a compose invocation.
 	// Tests replace it to record argv instead of calling Docker.
 	runner func(c compose.Stack, args ...string) error
+	// stderr receives aviary's progress lines for init steps.
+	stderr io.Writer
 }
 
 // Options adjusts how Load builds a stack.
@@ -84,7 +88,7 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Stack{Config: cfg, Workspace: ws, Entry: entry, registry: reg, runner: compose.Stack.Run}, nil
+	return &Stack{Config: cfg, Workspace: ws, Entry: entry, registry: reg, runner: compose.Stack.Run, stderr: os.Stderr}, nil
 }
 
 // checkRequiredEnv treats an empty variable as missing: an empty credential
@@ -110,6 +114,9 @@ func (s *Stack) Env() map[string]string {
 		"AVIARY_PROJECT":       s.Workspace.Project(),
 		"AVIARY_SLUG":          s.Workspace.Slug,
 		"AVIARY_ROOT":          s.Workspace.Root,
+		// The definition's directory, so a compose file can reach files
+		// kept next to an external aviary.yml.
+		"AVIARY_CONFIG_DIR": s.Workspace.Definition,
 	}
 	for name, port := range s.Entry.Ports {
 		env["AVIARY_PORT_"+strings.ToUpper(name)] = strconv.Itoa(port)
@@ -178,20 +185,32 @@ func (s *Stack) Init(force bool) error {
 	return s.markInitialized(true)
 }
 
-// runSteps runs steps in order and stops at the first failure. The error
-// names the step and is deliberately not a *compose.ExitError, so the CLI
-// reports it as aviary's own failure instead of exiting silently with the
-// step's status.
+// runSteps runs steps in order and stops at the first failure. It reports
+// each step as it starts, and its wall-clock time and the total as they
+// succeed. The error names the step and is deliberately not a
+// *compose.ExitError, so the CLI reports it as aviary's own failure instead
+// of exiting silently with the step's status.
 func (s *Stack) runSteps(phase string, steps []config.Step) error {
+	start := time.Now()
 	for i, step := range steps {
 		desc := step.Service + " " + strings.Join(step.Command, " ")
-		fmt.Fprintf(os.Stderr, "aviary: %s: %s\n", phase, desc)
+		fmt.Fprintf(s.stderr, "aviary: %s: %s\n", phase, desc)
+		stepStart := time.Now()
 		args := append([]string{"run", "--rm", step.Service}, step.Command...)
 		if err := s.run(nil, args...); err != nil {
 			return fmt.Errorf("%s step %d (%s) failed: %v", phase, i+1, desc, err)
 		}
+		fmt.Fprintf(s.stderr, "aviary: %s: step %d/%d ok %s\n", phase, i+1, len(steps), seconds(time.Since(stepStart)))
+	}
+	if len(steps) > 0 {
+		fmt.Fprintf(s.stderr, "aviary: %s: total %s\n", phase, seconds(time.Since(start)))
 	}
 	return nil
+}
+
+// seconds renders d as seconds to one decimal place, such as 2.1s.
+func seconds(d time.Duration) string {
+	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
 // Test runs the named suite: init first if the suite wants it, then its
