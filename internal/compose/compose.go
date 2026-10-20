@@ -11,6 +11,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -101,7 +102,7 @@ func (s Stack) Run(args ...string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return exitError(cmd.Run())
+	return exitError(runSignals(cmd))
 }
 
 // Output executes a compose subcommand and returns its stdout. Stderr still
@@ -114,10 +115,40 @@ func (s Stack) Output(args ...string) ([]byte, error) {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := runSignals(cmd); err != nil {
 		return nil, exitError(err)
 	}
 	return stdout.Bytes(), nil
+}
+
+// runSignals runs cmd to completion whatever signals aviary gets meanwhile.
+// Ctrl-C reaches compose directly, since the terminal interrupts the whole
+// foreground process group, so aviary ignores it and waits: compose stops
+// and removes its containers, and aviary exits with compose's status
+// instead of returning the prompt while compose is still cleaning up.
+// SIGTERM is usually sent to aviary alone, so it is passed on to compose.
+func runSignals(cmd *exec.Cmd) error {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case sig := <-sigs:
+				if sig == syscall.SIGTERM {
+					cmd.Process.Signal(sig)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return cmd.Wait()
 }
 
 // exitError turns a non-zero exit into *ExitError. A process killed by a
@@ -172,7 +203,7 @@ func DownProject(name string) error {
 	cmd := exec.Command("docker", downProjectArgs(name)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return exitError(cmd.Run())
+	return exitError(runSignals(cmd))
 }
 
 func downProjectArgs(name string) []string {

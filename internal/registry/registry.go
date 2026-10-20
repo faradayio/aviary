@@ -30,9 +30,11 @@ const Version = 1
 const FirstPort = 20000
 
 // The range is cut into portSlots blocks of slotWidth ports; each project
-// name hashes to the block its allocation starts at.
+// name hashes to the block its allocation starts at. It ends below 32768,
+// where Linux's ephemeral range starts (macOS's starts at 49152), so an
+// outbound connection never takes a port a stopped stack owns.
 const (
-	portSlots = 2000
+	portSlots = 638
 	slotWidth = 20
 	lastPort  = FirstPort + portSlots*slotWidth - 1
 )
@@ -57,8 +59,8 @@ type Entry struct {
 	CreatedAt time.Time      `json:"created_at"`
 	// InitializedAt is set once the stack's init steps have run since the
 	// stack was created or since aviary last removed its volumes (`down
-	// --volumes` or `rm`), and cleared by that removal. Volumes removed
-	// any other way leave it set.
+	// --volumes`, `compose down --volumes` or `rm`), and cleared by that
+	// removal. Volumes removed any other way leave it set.
 	InitializedAt *time.Time `json:"initialized_at,omitempty"`
 }
 
@@ -292,6 +294,22 @@ func (r *Registry) load() (*state, error) {
 	return s, nil
 }
 
+// LockProject takes an exclusive lock for one project, held across work that
+// reads and then updates its entry, such as running init steps, so two
+// aviary processes in one worktree do not both do it. It blocks until the
+// lock is free and returns the function that releases it.
+func (r *Registry) LockProject(project string) (unlock func() error, err error) {
+	dir := filepath.Join(filepath.Dir(r.path), "locks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	lock := flock.New(filepath.Join(dir, project+".lock"))
+	if err := lock.Lock(); err != nil {
+		return nil, fmt.Errorf("lock %s: %w", lock.Path(), err)
+	}
+	return lock.Unlock, nil
+}
+
 // update applies fn to the current state under an exclusive lock on
 // <path>.lock and replaces the file by writing <path>.tmp and renaming it.
 // Nothing is written when fn fails.
@@ -317,8 +335,39 @@ func (r *Registry) update(fn func(*state) error) error {
 		return err
 	}
 	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	if err := writeSynced(tmp, raw); err != nil {
 		return err
 	}
-	return os.Rename(tmp, r.path)
+	if err := os.Rename(tmp, r.path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(r.path))
+}
+
+// writeSynced writes path and flushes it to disk, so a crash after the
+// rename cannot leave the registry empty or truncated.
+func writeSynced(path string, raw []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir flushes dir so the rename itself survives a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

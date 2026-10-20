@@ -30,8 +30,7 @@ type Stack struct {
 	// registered.
 	Entry    registry.Entry
 	registry *registry.Registry
-	// runner runs one compose subcommand against a compose invocation.
-	// Tests replace it to record argv instead of calling Docker.
+	// runner is Options.Runner.
 	runner func(c compose.Stack, args ...string) error
 	// stderr receives aviary's progress lines for init steps.
 	stderr io.Writer
@@ -50,6 +49,10 @@ type Options struct {
 	NoAllocate bool
 	// Registry is where ports are allocated. It is required.
 	Registry *registry.Registry
+	// Runner runs one compose subcommand against a compose invocation. It
+	// defaults to compose.Stack.Run; tests replace it to record argv
+	// instead of calling Docker.
+	Runner func(c compose.Stack, args ...string) error
 }
 
 // Load builds the stack for the worktree containing cwd, allocating any host
@@ -88,7 +91,11 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Stack{Config: cfg, Workspace: ws, Entry: entry, registry: reg, runner: compose.Stack.Run, stderr: os.Stderr}, nil
+	runner := opts.Runner
+	if runner == nil {
+		runner = compose.Stack.Run
+	}
+	return &Stack{Config: cfg, Workspace: ws, Entry: entry, registry: reg, runner: runner, stderr: os.Stderr}, nil
 }
 
 // checkRequiredEnv treats an empty variable as missing: an empty credential
@@ -172,10 +179,20 @@ func (s *Stack) run(extraProfiles []string, args ...string) error {
 // Init seeds the stack's volumes by running each init step in a fresh
 // container, in order. Unless force is set, it is a no-op once init has run
 // since the stack was created or since aviary last removed its volumes
-// (`down --volumes` or `rm`). A failing step stops the sequence and
+// (`down --volumes`, `compose down --volumes` or `rm`). A failing step stops the sequence and
 // leaves the stack uninitialized, with the partial state kept for
-// inspection.
+// inspection. It holds the stack's lock throughout, so a second aviary in the
+// same worktree waits and then finds init done instead of running it again.
 func (s *Stack) Init(force bool) error {
+	unlock, err := s.registry.LockProject(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// Another aviary may have run init while this one waited for the lock.
+	if err := s.reload(); err != nil {
+		return err
+	}
 	if s.Entry.InitializedAt != nil && !force {
 		return nil
 	}
@@ -254,14 +271,45 @@ func (s *Stack) SuiteNames() []string {
 // init again next time. A stack that is not registered stays unregistered.
 func (s *Stack) Down(volumes bool) error {
 	args := []string{"down", "--remove-orphans"}
-	if volumes {
-		args = append(args, "--volumes")
+	if !volumes {
+		return s.run(nil, args...)
 	}
-	if err := s.run(nil, args...); err != nil {
+	args = append(args, "--volumes")
+	return s.RemoveVolumes(func() error { return s.run(nil, args...) })
+}
+
+// RemoveVolumes runs remove, a compose call that deletes the stack's
+// volumes, under the stack's lock, so it never removes them while another
+// aviary is running init. Once remove succeeds the stack is recorded as
+// uninitialized, so init runs again next time. A stack that is not registered
+// stays unregistered.
+func (s *Stack) RemoveVolumes(remove func() error) error {
+	unlock, err := s.registry.LockProject(s.Workspace.Project())
+	if err != nil {
 		return err
 	}
-	if volumes && s.Entry.Project != "" {
-		return s.markInitialized(false)
+	defer unlock()
+	if err := remove(); err != nil {
+		return err
+	}
+	if err := s.reload(); err != nil {
+		return err
+	}
+	if s.Entry.Project == "" {
+		return nil
+	}
+	return s.markInitialized(false)
+}
+
+// reload rereads the stack's registry entry, which another aviary process
+// may have changed since Load. An unregistered stack keeps its zero entry.
+func (s *Stack) reload() error {
+	entry, ok, err := s.registry.Get(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	if ok {
+		s.Entry = entry
 	}
 	return nil
 }

@@ -14,7 +14,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/faradayio/aviary/internal/compose"
 	"github.com/faradayio/aviary/internal/config"
@@ -653,5 +655,76 @@ func TestDownKeepsInitializedUnlessVolumesGo(t *testing.T) {
 	)
 	if s.Entry.InitializedAt != nil || entryFor(t, s).InitializedAt != nil {
 		t.Error("down --volumes left the stack marked initialized")
+	}
+}
+
+func TestConcurrentInitsInOneWorktreeRunTheStepsOnce(t *testing.T) {
+	first, _ := newStack(t, initConfig())
+	// A second aviary process in the same worktree, which loaded the stack
+	// before either had run init.
+	second := *first
+	var mu sync.Mutex
+	steps := 0
+	runner := func(compose.Stack, ...string) error {
+		mu.Lock()
+		steps++
+		mu.Unlock()
+		// Hold the step long enough for the other Init to be waiting.
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+	first.runner, second.runner = runner, runner
+
+	var wg sync.WaitGroup
+	for _, s := range []*Stack{first, &second} {
+		wg.Go(func() {
+			if err := s.Init(false); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if steps != len(initConfig().Init) {
+		t.Errorf("two concurrent Inits ran %d steps, want the %d steps once", steps, len(initConfig().Init))
+	}
+	if first.Entry.InitializedAt == nil || second.Entry.InitializedAt == nil {
+		t.Error("an Init returned without the stack marked initialized")
+	}
+}
+
+func TestRemoveVolumesWaitsForARunningInit(t *testing.T) {
+	s, _ := newStack(t, initConfig())
+	other := *s
+	stepStarted := make(chan struct{})
+	release := make(chan struct{})
+	s.runner = func(compose.Stack, ...string) error {
+		select {
+		case <-stepStarted:
+		default:
+			close(stepStarted)
+			<-release
+		}
+		return nil
+	}
+	initDone := make(chan error)
+	go func() { initDone <- s.Init(false) }()
+	<-stepStarted
+
+	removed := make(chan error)
+	go func() { removed <- other.RemoveVolumes(func() error { return nil }) }()
+	select {
+	case <-removed:
+		t.Fatal("RemoveVolumes ran while an init step was running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-initDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-removed; err != nil {
+		t.Fatal(err)
+	}
+	if entryFor(t, s).InitializedAt != nil {
+		t.Error("volumes removed after init finished, but the stack is still marked initialized")
 	}
 }

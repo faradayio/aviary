@@ -56,7 +56,8 @@ and two suites. Run `aviary test db` from that directory to try it.
 
 Each name under `ports` gets one host port per worktree, passed to compose as
 `AVIARY_PORT_<NAME>` (the name upper-cased). Ports start at a block between
-20000 and 59999 derived from the worktree's project name, so a worktree at the
+20000 and 32759, below the range the OS hands outbound connections, derived
+from the worktree's project name, so a worktree at the
 same path gets the same ports on every machine; they move only when another
 stack or process already holds them, and once allocated they are kept.
 Use the variable where the compose file publishes a port, with the usual port
@@ -80,7 +81,8 @@ require_env: [VAULT_TOKEN]
 ```
 
 Commands that start or run containers (`up`, `test`, `init`, `run`, `build`,
-`compose`) refuse to start, listing every missing name, when any of
+and `compose` with a subcommand that creates containers, such as `up` or
+`run`) refuse to start, listing every missing name, when any of
 these variables is unset or empty. The host environment passes through to
 compose, so the compose files can interpolate them.
 
@@ -159,9 +161,15 @@ steps succeed. A failing step stops the sequence, names the step, and leaves
 the stack uninitialized with the partial data kept for inspection.
 `aviary down --volumes` and `aviary rm` discard the data so init runs again
 next time; `aviary init --force` reruns the steps against the current data.
-aviary records in its registry that init has run rather than checking the
-volumes, so removing them any other way, such as `aviary compose down -v`,
-leaves the stack marked initialized until `aviary init --force`.
+`aviary compose down -v` counts too. aviary records in its registry that init
+has run rather than checking the volumes, so removing them any other way, such
+as `docker volume rm`, leaves the stack marked initialized until
+`aviary init --force`.
+
+Suites started at the same time in one worktree run init once: the first runs
+the steps and the others wait for it, then skip them. A `down --volumes` waits
+for a running init too. Ctrl-C stops the suite; aviary waits while compose
+removes its containers and exits with compose's status.
 
 Each worktree's stack has its own volumes, so a new worktree runs every init
 step from scratch, however many other worktrees of the repository are already
@@ -218,7 +226,10 @@ Run from anywhere inside a worktree.
   them as an object.
 - `aviary ls [--json]` lists every aviary stack on the machine.
 - `aviary gc [--dry-run]` removes stacks, volumes included, whose worktree
-  directory no longer exists, and releases their ports.
+  directory no longer exists, and releases their ports. A stack whose worktree
+  and the directory holding it are both missing is skipped with a warning, in
+  case it is on a disk that is not mounted; `aviary rm --project` removes it.
+  A stack that fails to come down does not stop gc removing the others.
 - `aviary rm [--project <name>]` removes this worktree's stack, or the named
   one, with its volumes, and releases its ports. A later command that starts
   the stack, or `aviary env`, registers it again; allocation starts again at

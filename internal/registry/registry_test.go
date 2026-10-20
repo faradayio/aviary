@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // busyPorts is a Prober that reports the listed ports as taken and every
@@ -92,7 +93,7 @@ func TestAllocateIsStableAndFollowsTheNameList(t *testing.T) {
 func TestBasePortIsAFixedFunctionOfTheProjectName(t *testing.T) {
 	// Known FNV-1a answers: a change here moves every new stack's ports on
 	// every machine, so it must be deliberate.
-	for project, want := range map[string]int{"aviary-a": 51180, "aviary-b": 43560} {
+	for project, want := range map[string]int{"aviary-a": 24660, "aviary-b": 27320} {
 		if got := BasePort(project); got != want {
 			t.Errorf("BasePort(%q) = %d, want %d", project, got, want)
 		}
@@ -568,5 +569,42 @@ func TestOpenIgnoresARelativeXDGStateHome(t *testing.T) {
 	}
 	if want := filepath.Join(abs, "aviary", "registry.json"); reg.Path() != want {
 		t.Errorf("absolute XDG_STATE_HOME: Path = %s, want %s", reg.Path(), want)
+	}
+}
+
+func TestLockProjectExcludesASecondHolderUntilReleased(t *testing.T) {
+	reg := open(t)
+	unlock, err := reg.LockProject("aviary-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another project's lock is independent.
+	unlockB, err := reg.LockProject("aviary-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlockB()
+
+	acquired := make(chan func() error)
+	go func() {
+		second, err := reg.LockProject("aviary-a")
+		if err != nil {
+			t.Error(err)
+		}
+		acquired <- second
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("a second LockProject returned while the first holder still had the lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := unlock(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case second := <-acquired:
+		second()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second LockProject did not get the lock after the first released it")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -94,7 +95,7 @@ func (a *app) rootCmd() *cobra.Command {
 		a.passthrough("ps", "List this stack's containers", inspectsOnly, "ps"),
 		a.passthrough("logs [service...]", "Show container logs", inspectsOnly, "logs"),
 		a.passthrough("build [service...]", "Build the stack's images", startsContainers, "build"),
-		a.passthrough("compose <args...>", "Run any docker compose subcommand against this stack", startsContainers),
+		a.composeCmd(),
 		a.envCmd(),
 		a.lsCmd(),
 		a.gcCmd(),
@@ -132,6 +133,7 @@ func (a *app) loadStack(opts stack.Options) (*stack.Stack, error) {
 	if opts.Registry, err = a.openRegistry(); err != nil {
 		return nil, err
 	}
+	opts.Runner = a.runCompose
 	return stack.Load(cwd, a.configDir(), opts)
 }
 
@@ -156,6 +158,77 @@ Every argument is passed to docker compose unchanged, so aviary flags such as
 			return a.runCompose(s.Compose(), slices.Concat(sub, args)...)
 		},
 	}
+}
+
+// composeCmd forwards a whole compose command line. A subcommand that only
+// inspects or stops the stack loads it like the other inspecting commands,
+// and a `down` that removes volumes marks the stack uninitialized, as
+// `aviary down --volumes` does.
+func (a *app) composeCmd() *cobra.Command {
+	cmd := a.passthrough("compose <args...>", "Run any docker compose subcommand against this stack", startsContainers)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		sub, rest := composeSubcommand(args)
+		opts := startsContainers
+		if inspectingSubcommands[sub] {
+			opts = inspectsOnly
+		}
+		s, err := a.loadStack(opts)
+		if err != nil {
+			return err
+		}
+		run := func() error { return a.runCompose(s.Compose(), args...) }
+		if sub == "down" && removesVolumes(rest) {
+			return s.RemoveVolumes(run)
+		}
+		return run()
+	}
+	return cmd
+}
+
+// inspectingSubcommands are the compose subcommands that create no
+// container: they look at, stop, remove or exec into the stack's existing
+// ones.
+var inspectingSubcommands = map[string]bool{
+	"attach": true, "config": true, "cp": true, "down": true, "events": true,
+	"exec": true, "images": true, "kill": true, "logs": true, "ls": true,
+	"pause": true, "port": true, "ps": true, "rm": true, "stats": true,
+	"stop": true, "top": true, "unpause": true, "version": true,
+	"volumes": true, "wait": true,
+}
+
+// composeValueFlags are compose's global flags that take a separate value.
+var composeValueFlags = map[string]bool{
+	"--ansi": true, "--env-file": true, "-f": true, "--file": true,
+	"--parallel": true, "--profile": true, "--progress": true,
+	"-p": true, "--project-name": true, "--project-directory": true,
+}
+
+// composeSubcommand returns the compose subcommand in args, skipping the
+// global flags before it, and the arguments after it.
+func composeSubcommand(args []string) (sub string, rest []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			return arg, args[i+1:]
+		}
+		if composeValueFlags[arg] {
+			i++
+		}
+	}
+	return "", nil
+}
+
+// removesVolumes reports whether down's arguments ask it to remove volumes.
+func removesVolumes(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "-v" || arg == "--volumes" || arg == "--volumes=true" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *app) downCmd() *cobra.Command {
@@ -391,8 +464,14 @@ func (a *app) gcCmd() *cobra.Command {
 				return err
 			}
 			out := cmd.OutOrStdout()
+			// One stack that cannot be removed must not keep the rest.
+			var errs []error
 			for _, e := range entries {
-				if !rootMissing(e.Root) {
+				switch worktreeState(e.Root) {
+				case worktreePresent:
+					continue
+				case worktreeUnreachable:
+					fmt.Fprintf(cmd.ErrOrStderr(), "aviary: %s: neither worktree %s nor its parent directory exists; skipped in case it is on a disk that is not mounted (aviary rm --project %s removes it)\n", e.Project, e.Root, e.Project)
 					continue
 				}
 				if dryRun {
@@ -400,11 +479,12 @@ func (a *app) gcCmd() *cobra.Command {
 					continue
 				}
 				if err := a.remove(reg, e.Project); err != nil {
-					return err
+					errs = append(errs, err)
+					continue
 				}
 				fmt.Fprintf(out, "%s: worktree %s is gone; removed\n", e.Project, e.Root)
 			}
-			return nil
+			return errors.Join(errs...)
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would be removed without removing it")
@@ -465,12 +545,34 @@ func (a *app) remove(reg *registry.Registry, project string) error {
 	return reg.Release(project)
 }
 
-// rootMissing reports whether a stack's worktree has been deleted. Any other
-// stat failure counts as present, so gc never removes a stack's volumes over
-// a permissions problem.
+type rootState int
+
+const (
+	worktreePresent rootState = iota
+	// worktreeMissing is a deleted worktree: the root is gone but the
+	// directory that held it is still there.
+	worktreeMissing
+	// worktreeUnreachable is a root whose parent directory is gone too,
+	// as when it is on a disk or share that is not mounted.
+	worktreeUnreachable
+)
+
+// worktreeState reports whether a stack's worktree has been deleted. Any
+// stat failure other than not-existing counts as present, so gc never
+// removes a stack's volumes over a permissions problem.
+func worktreeState(root string) rootState {
+	if _, err := os.Stat(root); !errors.Is(err, fs.ErrNotExist) {
+		return worktreePresent
+	}
+	if info, err := os.Stat(filepath.Dir(root)); err == nil && info.IsDir() {
+		return worktreeMissing
+	}
+	return worktreeUnreachable
+}
+
+// rootMissing reports whether a stack's worktree has been deleted.
 func rootMissing(root string) bool {
-	_, err := os.Stat(root)
-	return errors.Is(err, fs.ErrNotExist)
+	return worktreeState(root) == worktreeMissing
 }
 
 func printJSON(out io.Writer, v any) error {

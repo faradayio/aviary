@@ -284,3 +284,24 @@ func TestStackRefusesAnInvalidProjectBeforeRunningCompose(t *testing.T) {
 		t.Fatal("a stack with an empty project ran docker")
 	}
 }
+
+// The child interrupts the test process, as a terminal's Ctrl-C interrupts
+// both aviary and compose. runSignals must keep the process alive and return
+// the child's own status once it exits.
+func TestRunSignalsWaitsOutAnInterruptAndKeepsTheChildsStatus(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "kill -INT $PPID; sleep 0.2; exit 3")
+	err := exitError(runSignals(cmd))
+	var exit *ExitError
+	if !errors.As(err, &exit) || exit.Code != 3 {
+		t.Fatalf("runSignals = %v, want the child's status 3", err)
+	}
+}
+
+func TestRunSignalsForwardsSIGTERM(t *testing.T) {
+	cmd := exec.Command("sh", "-c", `trap 'exit 9' TERM; kill -TERM $PPID; sleep 5 & wait`)
+	err := exitError(runSignals(cmd))
+	var exit *ExitError
+	if !errors.As(err, &exit) || exit.Code != 9 {
+		t.Fatalf("runSignals = %v, want the child to get SIGTERM and exit 9", err)
+	}
+}

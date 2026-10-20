@@ -35,6 +35,8 @@ type harness struct {
 	downed   []string
 	downErr  error
 	composed []composeCall
+	// goneRoot is the deleted worktree lsFixture registers.
+	goneRoot string
 	// stderr holds what the last run printed to stderr.
 	stderr bytes.Buffer
 }
@@ -206,8 +208,8 @@ func TestUnknownCommandFails(t *testing.T) {
 }
 
 // lsFixture registers an initialized in-tree stack whose worktree exists and
-// is running, and an external one whose worktree is gone and that compose
-// does not know about.
+// is running, and an external one whose worktree is gone, from a directory
+// that is still there, and that compose does not know about.
 func lsFixture(t *testing.T) (h *harness, liveRoot string) {
 	t.Helper()
 	h = newHarness(t)
@@ -216,7 +218,8 @@ func lsFixture(t *testing.T) (h *harness, liveRoot string) {
 	if _, err := h.reg.SetInitialized("aviary-live-111111", true); err != nil {
 		t.Fatal(err)
 	}
-	h.register(t, "aviary-gone-222222", "/nonexistent/aviary-test/gone", "/defs/myrepo")
+	h.goneRoot = filepath.Join(tempDir(t), "gone")
+	h.register(t, "aviary-gone-222222", h.goneRoot, "/defs/myrepo")
 	h.projects = []compose.Project{
 		{Name: "aviary-live-111111", Status: "running(2)"},
 		{Name: "someone-elses", Status: "running(1)"},
@@ -239,7 +242,7 @@ func TestLsJSONJoinsRegistryWithComposeStatus(t *testing.T) {
 	gone, live := h.entry(t, "aviary-gone-222222"), h.entry(t, "aviary-live-111111")
 	want := []map[string]any{
 		{
-			"project": "aviary-gone-222222", "status": "down", "root": "/nonexistent/aviary-test/gone",
+			"project": "aviary-gone-222222", "status": "down", "root": h.goneRoot,
 			"branch": "", "worktree_missing": true, "initialized": false,
 			"created_at": gone.CreatedAt.Format(time.RFC3339Nano), "initialized_at": nil,
 			"ports": map[string]any{}, "config": "/defs/myrepo",
@@ -292,7 +295,7 @@ func TestLsTable(t *testing.T) {
 	base := registry.BasePort("aviary-live-111111")
 	for i, want := range [][]string{
 		{"PROJECT", "STATUS", "BRANCH", "WORKTREE", "CONFIG", "PORTS"},
-		{"aviary-gone-222222", "down", "(worktree", "missing)", "-", "/nonexistent/aviary-test/gone", "/defs/myrepo", "-"},
+		{"aviary-gone-222222", "down", "(worktree", "missing)", "-", h.goneRoot, "/defs/myrepo", "-"},
 		{"aviary-live-111111", "running(2)", "branch-of-" + filepath.Base(liveRoot), liveRoot, "in-tree", "postgres=" + strconv.Itoa(base), "redis=" + strconv.Itoa(base+1)},
 	} {
 		if got := strings.Fields(lines[i]); !slices.Equal(got, want) {
@@ -341,7 +344,7 @@ func TestGCDryRunReportsWithoutRemoving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "aviary-gone-222222: worktree /nonexistent/aviary-test/gone is gone; would remove\n"; out != want {
+	if want := "aviary-gone-222222: worktree " + h.goneRoot + " is gone; would remove\n"; out != want {
 		t.Errorf("gc --dry-run printed %q, want %q", out, want)
 	}
 	if len(h.downed) != 0 {
@@ -459,9 +462,7 @@ suites:
 	t.Chdir(root)
 	h := newHarness(t)
 
-	// down is left out: its compose call is not behind the app seam, so it
-	// would run docker. The stack tests cover Down on an unregistered stack.
-	for _, args := range [][]string{{"ps"}, {"logs"}, {"logs", "app"}, {"exec", "web", "ls"}, {"test"}} {
+	for _, args := range [][]string{{"ps"}, {"logs"}, {"logs", "app"}, {"exec", "web", "ls"}, {"down"}, {"down", "--volumes"}, {"compose", "down", "-v"}, {"test"}} {
 		if _, err := h.run(t, args...); err != nil {
 			t.Fatalf("aviary %s: %v", strings.Join(args, " "), err)
 		}
@@ -469,8 +470,8 @@ suites:
 			t.Fatalf("aviary %s wrote the registry (stat err %v)", strings.Join(args, " "), err)
 		}
 	}
-	if len(h.composed) != 4 {
-		t.Fatalf("compose calls = %v, want ps, logs twice and exec through the passthrough", h.composed)
+	if len(h.composed) != 7 {
+		t.Fatalf("compose calls = %v, want ps, logs twice, exec and three downs", h.composed)
 	}
 	if port, ok := h.composed[0].stack.Env["AVIARY_PORT_POSTGRES"]; ok {
 		t.Errorf("ps on an unregistered stack set AVIARY_PORT_POSTGRES=%s, want it unset", port)
@@ -652,12 +653,12 @@ suites:
 	t.Setenv("AVIARY_TEST_MISSING", "")
 	t.Chdir(root)
 
-	for _, args := range [][]string{{"ps"}, {"logs"}, {"logs", "app"}, {"exec", "web", "ls"}, {"env"}, {"test"}} {
+	for _, args := range [][]string{{"ps"}, {"logs"}, {"logs", "app"}, {"exec", "web", "ls"}, {"env"}, {"test"}, {"compose", "config"}, {"compose", "-f", "x.yaml", "down", "-v"}} {
 		if _, err := newHarness(t).run(t, args...); err != nil {
 			t.Errorf("aviary %s failed on a missing require_env name: %v", strings.Join(args, " "), err)
 		}
 	}
-	for _, args := range [][]string{{"up"}, {"run", "app"}, {"build"}, {"compose", "config"}, {"init"}, {"test", "unit"}} {
+	for _, args := range [][]string{{"up"}, {"run", "app"}, {"build"}, {"compose", "run", "app"}, {"compose", "--profile", "x", "up"}, {"init"}, {"test", "unit"}} {
 		h := newHarness(t)
 		_, err := h.run(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "AVIARY_TEST_MISSING") {
@@ -665,6 +666,95 @@ suites:
 		}
 		if len(h.composed) != 0 {
 			t.Errorf("aviary %s ran compose despite a missing require_env name", strings.Join(args, " "))
+		}
+	}
+}
+
+func TestGCRemovesTheRestWhenOneStackFails(t *testing.T) {
+	h, _ := lsFixture(t)
+	h.register(t, "aviary-also-gone-444444", filepath.Join(filepath.Dir(h.goneRoot), "also-gone"), "")
+	// Sorted first, so a gc that stopped at the first failure would skip
+	// aviary-gone-222222.
+	h.app.downProject = func(name string) error {
+		h.downed = append(h.downed, name)
+		if name == "aviary-also-gone-444444" {
+			return &compose.ExitError{Code: 1}
+		}
+		return nil
+	}
+
+	_, err := h.run(t, "gc")
+	if err == nil || !strings.Contains(err.Error(), "aviary-also-gone-444444") {
+		t.Fatalf("gc error = %v, want one naming the stack that failed", err)
+	}
+	if want := []string{"aviary-also-gone-444444", "aviary-gone-222222"}; !slices.Equal(h.downed, want) {
+		t.Errorf("gc took down %v, want %v", h.downed, want)
+	}
+	if got, want := h.projectNames(t), []string{"aviary-also-gone-444444", "aviary-live-111111"}; !slices.Equal(got, want) {
+		t.Errorf("registry after gc = %v, want %v", got, want)
+	}
+}
+
+func TestGCSkipsAWorktreeWhoseParentIsGoneToo(t *testing.T) {
+	h := newHarness(t)
+	h.register(t, "aviary-unmounted-555555", "/nonexistent/aviary-test/unmounted", "")
+
+	out, err := h.run(t, "gc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "" || len(h.downed) != 0 {
+		t.Errorf("gc printed %q and took down %v, want nothing removed", out, h.downed)
+	}
+	if !strings.Contains(h.stderr.String(), "skipped") {
+		t.Errorf("gc stderr = %q, want it to say the stack was skipped", h.stderr.String())
+	}
+	if got := h.projectNames(t); len(got) != 1 {
+		t.Errorf("registry after gc = %v, want the stack kept", got)
+	}
+}
+
+func TestComposeDownVolumesMarksTheStackUninitialized(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\n")
+	t.Chdir(root)
+	h := newHarness(t)
+	if _, err := h.run(t, "up"); err != nil {
+		t.Fatal(err)
+	}
+	project := h.projectNames(t)[0]
+	if _, err := h.reg.SetInitialized(project, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.run(t, "compose", "down"); err != nil {
+		t.Fatal(err)
+	}
+	if h.entry(t, project).InitializedAt == nil {
+		t.Error("compose down without volumes cleared initialized")
+	}
+	if _, err := h.run(t, "compose", "--profile", "x", "down", "--volumes"); err != nil {
+		t.Fatal(err)
+	}
+	if h.entry(t, project).InitializedAt != nil {
+		t.Error("compose down --volumes left the stack marked initialized")
+	}
+}
+
+func TestComposeSubcommandSkipsGlobalFlags(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		sub  string
+		rest []string
+	}{
+		{[]string{"down", "-v"}, "down", []string{"-v"}},
+		{[]string{"--profile", "x", "-f", "a.yaml", "down"}, "down", []string{}},
+		{[]string{"--profile=x", "--dry-run", "run", "app", "true"}, "run", []string{"app", "true"}},
+		{[]string{"--profile"}, "", nil},
+	} {
+		sub, rest := composeSubcommand(tc.args)
+		if sub != tc.sub || !slices.Equal(rest, tc.rest) {
+			t.Errorf("composeSubcommand(%q) = %q, %q, want %q, %q", tc.args, sub, rest, tc.sub, tc.rest)
 		}
 	}
 }
