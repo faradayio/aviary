@@ -32,21 +32,20 @@ func TestSlugIsComposeSafeAndDistinctPerPath(t *testing.T) {
 }
 
 func TestProjectPrefixesTheSlugOnce(t *testing.T) {
-	for _, root := range []string{"/work/wt-a", "/work/aviary-test-1", "/work/Aviary-Test-1", "/work/aviary", "/work/aviaryish"} {
-		slug := Slug(root)
-		want := ProjectPrefix + slug
-		if strings.HasPrefix(slug, ProjectPrefix) {
-			want = slug
+	// The hash is the first six hex digits of the SHA-1 of the root path.
+	for _, c := range []struct{ root, want string }{
+		{"/work/wt-a", "aviary-wt-a-fd6ee8"},
+		{"/work/aviaryish", "aviary-aviaryish-6b1a0f"},
+		// A slug that already starts with the prefix is the project name.
+		{"/work/aviary-test-1", "aviary-test-1-e06155"},
+		{"/work/Aviary-Test-1", "aviary-test-1-a5afbb"},
+		{"/work/aviary", "aviary-51e15e"},
+		{"/work/aviary.", "aviary-6220a5"},
+		{"/work/Aviary_tools", "aviary-tools-663c0a"},
+	} {
+		if got := (Workspace{Root: c.root, Slug: Slug(c.root)}).Project(); got != c.want {
+			t.Errorf("Project() for %s = %q, want %q", c.root, got, c.want)
 		}
-		if got := (Workspace{Root: root, Slug: slug}).Project(); got != want {
-			t.Errorf("Project() for %s = %q, want %q", root, got, want)
-		}
-	}
-	if got, want := (Workspace{Slug: Slug("/work/aviary-test-1")}).Project(), "aviary-test-1-"; !strings.HasPrefix(got, want) {
-		t.Errorf("Project() for a basename starting with %q = %q, want it to start with %q", ProjectPrefix, got, want)
-	}
-	if got, want := (Workspace{Slug: Slug("/work/aviaryish")}).Project(), "aviary-aviaryish-"; !strings.HasPrefix(got, want) {
-		t.Errorf("Project() for a basename starting with aviary but not %q = %q, want it to start with %q", ProjectPrefix, got, want)
 	}
 }
 

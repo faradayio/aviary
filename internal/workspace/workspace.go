@@ -38,8 +38,10 @@ type Workspace struct {
 }
 
 // Project is the compose project name for this workspace's stack: the slug
-// with ProjectPrefix in front, or the slug alone when the worktree's
-// basename already starts with the prefix, as in aviary-test-1.
+// with ProjectPrefix in front, or the slug alone when the slug already starts
+// with the prefix. That is the case for a worktree named aviary, or aviary
+// followed by any character other than a letter or digit, as in aviary-test-1,
+// aviary. or Aviary_tools.
 func (w Workspace) Project() string {
 	if strings.HasPrefix(w.Slug, ProjectPrefix) {
 		return w.Slug

@@ -412,9 +412,9 @@ The compose project name is `aviary-<slug>`, where the slug is the worktree
 root's directory name (lower-cased, other characters replaced by `-`, at most
 30 characters) followed by `-` and the first six hex digits of the SHA-1 of the
 root's full path. When the slug already starts with `aviary-`, as for a
-worktree named `aviary-test-1`, the slug alone is the project name. Two
-worktrees of one repository therefore never share containers, networks or
-named volumes, even when their directories have the same name.
+worktree named `aviary` or `aviary-test-1`, the slug alone is the project
+name. Two worktrees of one repository therefore never share containers,
+networks or named volumes, even when their directories have the same name.
 
 Every compose call is
 `docker compose --project-name <project> --project-directory <root> --file ...`,
@@ -514,16 +514,29 @@ A memory limit in a compose file (`deploy.resources.limits.memory`) caps one
 service, so a runaway service is killed on its own instead of starving every
 stack.
 
-### A second stack for a worktree named `aviary-...`
+### A second stack for a worktree whose slug starts with `aviary-`
 
 aviary once put its `aviary-` prefix in front of every slug, so a worktree
 named `aviary-test-1` got the project `aviary-aviary-test-1-<hash>`. It now
 leaves a slug that already starts with `aviary-` alone (see
-[How isolation works](#how-isolation-works)), so such a worktree's stack has a
-new name. A stack created under the doubled name is no longer this worktree's:
-the next command that starts the stack creates a new, empty one on new ports,
-and `aviary ls` lists both. Remove the old one by name, which also removes its
-volumes, and start again:
+[How isolation works](#how-isolation-works)). The slug lower-cases the
+directory name and turns every other character into `-`, so this covers a
+worktree named `aviary`, or `aviary` followed by any character other than a
+letter or digit: `aviary-test-1`, `aviary.` and `Aviary_tools` all qualify.
+
+A stack created under the doubled name no longer belongs to its worktree.
+Every command there addresses the new project name instead:
+
+- `aviary ps`, `logs`, `exec` and `down` act on the new project, which has no
+  containers. `down` therefore leaves the old stack running and holding its
+  ports.
+- `aviary env`, and any command that starts the stack, registers the new
+  project with ports of its own. `up` then starts an empty stack and runs
+  init again.
+
+`aviary ls` lists the old stack under its doubled name, with this worktree as
+its root. Remove it by that name first, which also removes its volumes and
+releases its ports, then start again:
 
 ```sh
 aviary rm --project aviary-aviary-test-1-<hash>
