@@ -531,8 +531,9 @@ Every command there addresses the new project name instead:
   containers. `down` therefore leaves the old stack running and holding its
   ports.
 - `aviary env`, and any command that starts the stack, registers the new
-  project with ports of its own. `up` then starts an empty stack and runs
-  init again.
+  project with ports of its own. `up` then starts an empty stack; init has
+  not run for it, so run `aviary init`, or the next `aviary test` of a suite
+  that has init runs the init steps.
 
 `aviary ls` lists the old stack under its doubled name, with this worktree as
 its root. Remove it by that name first, which also removes its volumes and
@@ -541,6 +542,7 @@ releases its ports, then start again:
 ```sh
 aviary rm --project aviary-aviary-test-1-<hash>
 aviary up
+aviary init
 ```
 
 ## Development
