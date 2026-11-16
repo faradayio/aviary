@@ -300,8 +300,42 @@ command line, so they never show up in `ps`.
 
 Arguments after the suite name, with or without a `--`, are appended to its
 command, so `aviary test api -- --grep users` and `aviary test api --help`
-reach the test runner. aviary exits with the suite's status. `aviary test`
-alone lists the suites; `aviary test -h` prints the command's help.
+reach the test runner. When a suite sets `workdir` (either a `host: true` suite
+or a container suite whose working directory mounts that package), path
+arguments pointing inside `workdir` from the worktree root or caller directory
+are rewritten relative to `workdir` (`aviary test api -- src/api/test/foo.ts`
+passes `test/foo.ts`), preserving `:line` and `::test` selectors. aviary exits
+with the suite's status. `aviary test` alone lists the suites; `aviary test -h`
+prints the command's help.
+
+### Volume snapshots
+
+When seeding a database takes minutes, `snapshot` caches the seeded volumes
+under `$XDG_CACHE_HOME/aviary/snapshots` (`~/.cache/aviary/snapshots` by
+default) so later worktrees restore them in seconds:
+
+```yaml
+after_restore:
+  - service: migrate
+    command: [rake, db:migrate]
+snapshot:
+  volumes: [postgres]
+  key_files: [db/seeds.rb, db/reference_data.sql]
+  stamp_files: [db/structure.sql]
+```
+
+The snapshot key hashes the volume names, the images mounting them, the `init`
+steps, and every file or directory in `key_files`. The stamp hashes
+`stamp_files`. On `init` (unless `aviary init --force` is passed):
+
+- **Exact `(key, stamp)` hit**: stops the stack's containers, restores the
+  volumes, and skips both `init` and `after_restore`.
+- **Same `key`, different `stamp`** (when `after_restore` is non-empty):
+  restores the newest cached snapshot for `key`, runs `after_restore`, stops
+  the stack to flush database state, and saves the migrated snapshot under the
+  new `stamp`.
+- **Cache miss** (or `aviary init --force`): runs `init`, stops the stack to
+  flush database state, and saves the snapshot under `(key, stamp)`.
 
 Init runs once per stack, so a new worktree runs it from scratch. Step times
 go to stderr. A failing step stops the sequence, names the step, and leaves

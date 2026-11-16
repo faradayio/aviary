@@ -152,6 +152,7 @@ func (a *app) upCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		s.WarnDockerDesktop()
 		if err := s.Prepare(); err != nil {
 			return err
 		}
@@ -230,6 +231,7 @@ func (a *app) runCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		s.WarnDockerDesktop()
 		if err := s.Prepare(); err != nil {
 			return err
 		}
@@ -256,6 +258,9 @@ Every argument is passed to docker compose unchanged, so aviary flags such as
 			if err != nil {
 				return err
 			}
+			if !opts.SkipRequireEnv {
+				s.WarnDockerDesktop()
+			}
 			return a.runCompose(s.Compose(), slices.Concat(sub, args)...)
 		},
 	}
@@ -276,6 +281,9 @@ func (a *app) composeCmd() *cobra.Command {
 		s, err := a.loadStack(opts)
 		if err != nil {
 			return err
+		}
+		if !opts.SkipRequireEnv {
+			s.WarnDockerDesktop()
 		}
 		run := func() error { return a.runCompose(s.Compose(), args...) }
 		if sub == "down" && removesVolumes(rest) {

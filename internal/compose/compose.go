@@ -256,8 +256,9 @@ type Resolved struct {
 }
 
 type ResolvedService struct {
-	Image   string          `json:"image"`
-	Volumes []ResolvedMount `json:"volumes"`
+	Image    string          `json:"image"`
+	Platform string          `json:"platform"`
+	Volumes  []ResolvedMount `json:"volumes"`
 }
 
 type ResolvedMount struct {
@@ -295,11 +296,29 @@ func (r *Resolved) ImagesMounting(volume string) []string {
 	var images []string
 	for _, svc := range r.Services {
 		for _, m := range svc.Volumes {
-			if m.Type == "volume" && m.Source == volume {
+			if m.Type == "volume" && m.Source == volume && svc.Image != "" {
 				images = append(images, svc.Image)
 			}
 		}
 	}
 	slices.Sort(images)
-	return images
+	return slices.Compact(images)
+}
+
+// ArchiveContainer returns the image and platform of a service that mounts the
+// named volume, picking the first service by name so the choice is
+// deterministic.
+func (r *Resolved) ArchiveContainer(volume string) (image, platform string) {
+	for _, name := range slices.Sorted(maps.Keys(r.Services)) {
+		svc := r.Services[name]
+		if svc.Image == "" {
+			continue
+		}
+		for _, m := range svc.Volumes {
+			if m.Type == "volume" && m.Source == volume {
+				return svc.Image, svc.Platform
+			}
+		}
+	}
+	return "", ""
 }

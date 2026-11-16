@@ -239,8 +239,9 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"suite without command":              {base + "suites:\n  api:\n    service: api\n", `suite "api": needs a command`},
 		"suite with an empty need":           {base + "suites:\n  api: {service: api, command: [t], needs: [db, \"\"]}\n", `suite "api": needs[1] is empty`},
 		"suite with an empty profile":        {base + "suites:\n  api: {service: api, command: [t], profiles: [\"\"]}\n", `suite "api": profiles[0] is empty`},
-		"snapshot without volumes":           {base + "snapshot:\n  key_files: [seeds/]\n", "snapshot.volumes"},
-		"snapshot with empty volumes":        {base + "snapshot:\n  volumes: []\n", "snapshot.volumes"},
+		"snapshot without volumes":           {base + "snapshot:\n  key_files: [seeds/]\n", "snapshot: volumes"},
+		"snapshot with empty volumes":        {base + "snapshot:\n  volumes: []\n", "snapshot: volumes"},
+		"snapshot with abs key_file":         {base + "snapshot:\n  volumes: [pg]\n  key_files: [/etc/passwd]\n", "must be relative"},
 		"require_env with a dash":            {base + "require_env: [VAULT-TOKEN]\n", `require_env name "VAULT-TOKEN"`},
 		"require_env starting with a digit":  {base + "require_env: [1TOKEN]\n", `require_env name "1TOKEN"`},
 		"require_env empty name":             {base + "require_env: [\"\"]\n", `require_env name ""`},
@@ -251,7 +252,7 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"host_env without path":              {base + "host_env:\n  FOO: {required: true}\n", `host_env["FOO"]: needs path`},
 		"prepare without command":            {base + "prepare:\n  - {}\n", "prepare[0]: needs a command"},
 		"host suite with service":            {base + "suites:\n  s: {host: true, service: api, command: [t]}\n", "host suite must not set service"},
-		"container suite with workdir":       {base + "suites:\n  s: {service: api, workdir: src/x, command: [t]}\n", "workdir is only for host suites"},
+		"suite with escaping workdir":        {base + "suites:\n  s: {service: api, workdir: ../outside, command: [t]}\n", "must be relative"},
 		"host suite with abs workdir":        {base + "suites:\n  s: {host: true, workdir: /abs, command: [t]}\n", "must be relative"},
 	}
 	for name, c := range cases {
@@ -296,5 +297,45 @@ func TestMinimalExampleLoads(t *testing.T) {
 	}
 	if !cfg.Suites["db"].WantsInit() || cfg.Suites["smoke"].WantsInit() {
 		t.Errorf("db should want init and smoke should not: %+v", cfg.Suites)
+	}
+}
+
+func TestSuiteNormalizeArgsStripsPackagePrefixAndPreservesSelectors(t *testing.T) {
+	root := t.TempDir()
+	specFile := filepath.Join(root, "workers", "model_train", "tests", "citus", "test_insights.py")
+	if err := os.MkdirAll(filepath.Dir(specFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(specFile, []byte("# test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	suite := Suite{Service: "model_train", Workdir: "workers/model_train", Command: []string{"pytest"}}
+
+	got := suite.NormalizeArgs(root, root, []string{
+		"workers/model_train/tests/citus/test_insights.py::test_bar",
+		"./workers/model_train/tests/citus/test_insights.py",
+		specFile + "::test_abs",
+		"tests/citus/test_insights.py",
+		"-k", "workers/model_train/keep_pattern",
+		"workers/model_train/tests/**/*.py",
+	})
+	want := []string{
+		"tests/citus/test_insights.py::test_bar",
+		"tests/citus/test_insights.py",
+		"tests/citus/test_insights.py::test_abs",
+		"tests/citus/test_insights.py",
+		"-k", "workers/model_train/keep_pattern",
+		"tests/**/*.py",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeArgs =\n got %q\nwant %q", got, want)
+	}
+
+	// Invoked from an intermediate directory (`workers/`).
+	fromWorkers := suite.NormalizeArgs(root, filepath.Join(root, "workers"), []string{
+		"model_train/tests/citus/test_insights.py:42",
+	})
+	if !reflect.DeepEqual(fromWorkers, []string{"tests/citus/test_insights.py:42"}) {
+		t.Fatalf("NormalizeArgs from parent subdir = %q", fromWorkers)
 	}
 }

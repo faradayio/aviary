@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -114,8 +115,10 @@ type Suite struct {
 	// to the worktree root) instead of `docker compose run` inside Service,
 	// with the stack's AVIARY_* environment variables and Suite.Env set.
 	Host bool `yaml:"host"`
-	// Workdir is the host working directory, relative to the worktree root,
-	// when Host is true. Defaults to the worktree root.
+	// Workdir is the suite's package directory, relative to the worktree root.
+	// When Host is true, Command runs in Workdir on the host. For every suite
+	// with Workdir set, aviary strips the package directory prefix from path
+	// arguments passed to `aviary test` so paths work from the repo root too.
 	Workdir string `yaml:"workdir"`
 	// Env holds extra environment variables passed to the suite's command
 	// after `${VAR}` interpolation against the stack's environment.
@@ -228,8 +231,35 @@ func (c *Config) validate() error {
 			return fmt.Errorf("suite %q: %w", name, err)
 		}
 	}
-	if c.Snapshot != nil && len(c.Snapshot.Volumes) == 0 {
-		return fmt.Errorf("snapshot.volumes must name at least one volume")
+	if c.Snapshot != nil {
+		if err := c.Snapshot.validate(); err != nil {
+			return fmt.Errorf("snapshot: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s Snapshot) validate() error {
+	if len(s.Volumes) == 0 {
+		return fmt.Errorf("volumes must name at least one volume")
+	}
+	if err := noEmpty("volumes", s.Volumes); err != nil {
+		return err
+	}
+	if err := validRelativePaths("key_files", s.KeyFiles); err != nil {
+		return err
+	}
+	return validRelativePaths("stamp_files", s.StampFiles)
+}
+
+func validRelativePaths(field string, paths []string) error {
+	for i, p := range paths {
+		if p == "" {
+			return fmt.Errorf("%s[%d] is empty", field, i)
+		}
+		if !filepath.IsLocal(p) {
+			return fmt.Errorf("%s[%d] %q must be relative to the worktree root", field, i, p)
+		}
 	}
 	return nil
 }
@@ -286,16 +316,13 @@ func (s Suite) validate() error {
 		if err := noEmpty("command", s.Command); err != nil {
 			return err
 		}
-		if filepath.IsAbs(s.Workdir) {
-			return fmt.Errorf("workdir %q must be relative to the worktree root", s.Workdir)
-		}
 	} else {
-		if s.Workdir != "" {
-			return fmt.Errorf("workdir is only for host suites")
-		}
 		if err := (Step{Service: s.Service, Command: s.Command}).validate(); err != nil {
 			return err
 		}
+	}
+	if s.Workdir != "" && s.Workdir != "." && !filepath.IsLocal(s.Workdir) {
+		return fmt.Errorf("workdir %q must be relative to the worktree root", s.Workdir)
 	}
 	for _, name := range slices.Sorted(maps.Keys(s.Env)) {
 		if !envName.MatchString(name) {
@@ -306,6 +333,104 @@ func (s Suite) validate() error {
 		return err
 	}
 	return noEmpty("profiles", s.Profiles)
+}
+
+// patternValueFlags are common test-runner flags whose following argument is a
+// filter expression rather than a file path.
+var patternValueFlags = map[string]bool{
+	"-e": true, "--example": true,
+	"-g": true, "--grep": true,
+	"-k": true, "-m": true, "-t": true,
+}
+
+// NormalizeArgs rewrites path arguments in extra that point inside s.Workdir
+// (from root, cwd, or an absolute path) so they are relative to s.Workdir.
+// Arguments already relative to s.Workdir, flags, and filter patterns are
+// returned unchanged.
+func (s Suite) NormalizeArgs(root, cwd string, extra []string) []string {
+	workdir := strings.TrimSuffix(filepath.ToSlash(filepath.Clean(s.Workdir)), "/")
+	if s.Workdir == "" || workdir == "." {
+		return extra
+	}
+	suiteDir := filepath.Join(root, filepath.FromSlash(workdir))
+	out := make([]string, len(extra))
+	skipNext := false
+	for i, arg := range extra {
+		if skipNext {
+			out[i] = arg
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			out[i] = arg
+			skipNext = patternValueFlags[arg]
+			continue
+		}
+		out[i] = normalizeSuiteArg(suiteDir, cwd, workdir, arg)
+	}
+	return out
+}
+
+func normalizeSuiteArg(suiteDir, cwd, workdir, arg string) string {
+	if arg == "" || strings.Contains(arg, "://") {
+		return arg
+	}
+	pathPart, suffix := splitSelector(arg)
+	if pathPart == "" {
+		return arg
+	}
+	if pathExists(filepath.Join(suiteDir, pathPart)) {
+		return arg
+	}
+	if filepath.IsAbs(pathPart) {
+		if rel, ok := relWithin(suiteDir, pathPart); ok {
+			return filepath.ToSlash(rel) + suffix
+		}
+		return arg
+	}
+	if cwd != "" && cwd != suiteDir {
+		candidate := filepath.Join(cwd, pathPart)
+		if pathExists(candidate) {
+			if rel, ok := relWithin(suiteDir, candidate); ok {
+				return filepath.ToSlash(rel) + suffix
+			}
+		}
+	}
+	trimmed := strings.TrimPrefix(filepath.ToSlash(pathPart), "./")
+	if trimmed == workdir || trimmed == workdir+"/" {
+		return "." + suffix
+	}
+	if strings.HasPrefix(trimmed, workdir+"/") {
+		return strings.TrimPrefix(trimmed, workdir+"/") + suffix
+	}
+	return arg
+}
+
+func splitSelector(arg string) (pathPart, suffix string) {
+	idx := strings.IndexByte(arg, ':')
+	if idx <= 0 {
+		return arg, ""
+	}
+	return arg[:idx], arg[idx:]
+}
+
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+func relWithin(base, target string) (string, bool) {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return "", false
+	}
+	if rel == "." {
+		return ".", true
+	}
+	if !filepath.IsLocal(rel) {
+		return "", false
+	}
+	return rel, true
 }
 
 func noEmpty(field string, values []string) error {
