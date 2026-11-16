@@ -8,10 +8,13 @@ import (
 	"bytes"
 	"fmt"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,6 +30,17 @@ type Config struct {
 	// aviary calls compose, so a missing credential fails with a clear
 	// message instead of a service boot failure.
 	RequireEnv []string `yaml:"require_env"`
+	// Vault, when set, mints and caches a child VAULT_TOKEN from the
+	// developer's ~/.vault-token when VAULT_TOKEN is absent or expired.
+	Vault *Vault `yaml:"vault"`
+	// HostEnv fills unset host environment variables from standard host
+	// files (such as Google Application Default Credentials) before
+	// require_env and compose run.
+	HostEnv map[string]HostFile `yaml:"host_env"`
+	// Prepare lists host commands run in the worktree root before init and
+	// before suites that do not opt out, such as copying gitignored API
+	// artifacts into a fresh worktree.
+	Prepare []HostStep `yaml:"prepare"`
 	// Init seeds a fresh stack from scratch. It runs once after the stack is
 	// created and again after aviary removes its volumes (`down --volumes`
 	// or `rm`).
@@ -40,6 +54,31 @@ type Config struct {
 	// another worktree with the same seed inputs restores them instead of
 	// running init again.
 	Snapshot *Snapshot `yaml:"snapshot"`
+}
+
+type Vault struct {
+	// Addr is the Vault server URL, such as https://vault2.faraday.ai.
+	Addr string `yaml:"addr"`
+	// TTL is the Go duration requested for minted child tokens (default 8h).
+	TTL string `yaml:"ttl"`
+}
+
+type HostFile struct {
+	// Path is a host file path (`~/` expands to the user's home directory)
+	// assigned to the environment variable when the variable is unset on
+	// the host and the file exists.
+	Path string `yaml:"path"`
+	// Required fails commands that start containers when the variable is
+	// unset and Path does not exist.
+	Required bool `yaml:"required"`
+	// Hint is appended to the error when Required is true and Path is
+	// missing, telling the user or agent what login command creates it.
+	Hint string `yaml:"hint"`
+}
+
+// HostStep is a command run on the host in the worktree root.
+type HostStep struct {
+	Command []string `yaml:"command"`
 }
 
 type Compose struct {
@@ -69,6 +108,21 @@ type Suite struct {
 	// Init is false for suites that run against an empty database and
 	// should not trigger the stack's init steps.
 	Init *bool `yaml:"init"`
+	// Prepare is false for suites that do not need the stack's host
+	// prepare steps to run first.
+	Prepare *bool `yaml:"prepare"`
+	// Host is true when Command runs directly on the host in Workdir (relative
+	// to the worktree root) instead of `docker compose run` inside Service,
+	// with the stack's AVIARY_* environment variables and Suite.Env set.
+	Host bool `yaml:"host"`
+	// Workdir is the suite's package directory, relative to the worktree root.
+	// When Host is true, Command runs in Workdir on the host. For every suite
+	// with Workdir set, aviary strips the package directory prefix from path
+	// arguments passed to `aviary test` so paths work from the repo root too.
+	Workdir string `yaml:"workdir"`
+	// Env holds extra environment variables passed to the suite's command
+	// after `${VAR}` interpolation against the stack's environment.
+	Env map[string]string `yaml:"env"`
 }
 
 type Snapshot struct {
@@ -88,6 +142,11 @@ type Snapshot struct {
 // WantsInit reports whether the suite should run the init steps first.
 func (s Suite) WantsInit() bool {
 	return s.Init == nil || *s.Init
+}
+
+// WantsPrepare reports whether the suite should run the host prepare steps first.
+func (s Suite) WantsPrepare() bool {
+	return s.Prepare == nil || *s.Prepare
 }
 
 var (
@@ -139,6 +198,24 @@ func (c *Config) validate() error {
 			return fmt.Errorf("require_env name %q must match %s", name, envName)
 		}
 	}
+	if c.Vault != nil {
+		if err := c.Vault.validate(); err != nil {
+			return fmt.Errorf("vault: %w", err)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(c.HostEnv)) {
+		if !envName.MatchString(name) {
+			return fmt.Errorf("host_env name %q must match %s", name, envName)
+		}
+		if err := c.HostEnv[name].validate(); err != nil {
+			return fmt.Errorf("host_env[%q]: %w", name, err)
+		}
+	}
+	for i, step := range c.Prepare {
+		if err := step.validate(); err != nil {
+			return fmt.Errorf("prepare[%d]: %w", i, err)
+		}
+	}
 	for i, step := range c.Init {
 		if err := step.validate(); err != nil {
 			return fmt.Errorf("init[%d]: %w", i, err)
@@ -154,10 +231,68 @@ func (c *Config) validate() error {
 			return fmt.Errorf("suite %q: %w", name, err)
 		}
 	}
-	if c.Snapshot != nil && len(c.Snapshot.Volumes) == 0 {
-		return fmt.Errorf("snapshot.volumes must name at least one volume")
+	if c.Snapshot != nil {
+		if err := c.Snapshot.validate(); err != nil {
+			return fmt.Errorf("snapshot: %w", err)
+		}
 	}
 	return nil
+}
+
+func (s Snapshot) validate() error {
+	if len(s.Volumes) == 0 {
+		return fmt.Errorf("volumes must name at least one volume")
+	}
+	if err := noEmpty("volumes", s.Volumes); err != nil {
+		return err
+	}
+	if err := validRelativePaths("key_files", s.KeyFiles); err != nil {
+		return err
+	}
+	return validRelativePaths("stamp_files", s.StampFiles)
+}
+
+func validRelativePaths(field string, paths []string) error {
+	for i, p := range paths {
+		if p == "" {
+			return fmt.Errorf("%s[%d] is empty", field, i)
+		}
+		if !filepath.IsLocal(p) {
+			return fmt.Errorf("%s[%d] %q must be relative to the worktree root", field, i, p)
+		}
+	}
+	return nil
+}
+
+func (v Vault) validate() error {
+	if v.Addr == "" {
+		return fmt.Errorf("needs addr")
+	}
+	u, err := url.Parse(v.Addr)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("addr %q must be an http or https URL", v.Addr)
+	}
+	if v.TTL != "" {
+		d, err := time.ParseDuration(v.TTL)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("ttl %q must be a positive Go duration (such as 8h)", v.TTL)
+		}
+	}
+	return nil
+}
+
+func (f HostFile) validate() error {
+	if f.Path == "" {
+		return fmt.Errorf("needs path")
+	}
+	return nil
+}
+
+func (s HostStep) validate() error {
+	if len(s.Command) == 0 {
+		return fmt.Errorf("needs a command")
+	}
+	return noEmpty("command", s.Command)
 }
 
 func (s Step) validate() error {
@@ -171,13 +306,131 @@ func (s Step) validate() error {
 }
 
 func (s Suite) validate() error {
-	if err := (Step{Service: s.Service, Command: s.Command}).validate(); err != nil {
-		return err
+	if s.Host {
+		if s.Service != "" {
+			return fmt.Errorf("host suite must not set service")
+		}
+		if len(s.Command) == 0 {
+			return fmt.Errorf("needs a command")
+		}
+		if err := noEmpty("command", s.Command); err != nil {
+			return err
+		}
+	} else {
+		if err := (Step{Service: s.Service, Command: s.Command}).validate(); err != nil {
+			return err
+		}
+	}
+	if s.Workdir != "" && s.Workdir != "." && !filepath.IsLocal(s.Workdir) {
+		return fmt.Errorf("workdir %q must be relative to the worktree root", s.Workdir)
+	}
+	for _, name := range slices.Sorted(maps.Keys(s.Env)) {
+		if !envName.MatchString(name) {
+			return fmt.Errorf("env name %q must match %s", name, envName)
+		}
 	}
 	if err := noEmpty("needs", s.Needs); err != nil {
 		return err
 	}
 	return noEmpty("profiles", s.Profiles)
+}
+
+// patternValueFlags are common test-runner flags whose following argument is a
+// filter expression rather than a file path.
+var patternValueFlags = map[string]bool{
+	"-e": true, "--example": true,
+	"-g": true, "--grep": true,
+	"-k": true, "-m": true, "-t": true,
+}
+
+// NormalizeArgs rewrites path arguments in extra that point inside s.Workdir
+// (from root, cwd, or an absolute path) so they are relative to s.Workdir.
+// Arguments already relative to s.Workdir, flags, and filter patterns are
+// returned unchanged.
+func (s Suite) NormalizeArgs(root, cwd string, extra []string) []string {
+	workdir := strings.TrimSuffix(filepath.ToSlash(filepath.Clean(s.Workdir)), "/")
+	if s.Workdir == "" || workdir == "." {
+		return extra
+	}
+	suiteDir := filepath.Join(root, filepath.FromSlash(workdir))
+	out := make([]string, len(extra))
+	skipNext := false
+	for i, arg := range extra {
+		if skipNext {
+			out[i] = arg
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			out[i] = arg
+			skipNext = patternValueFlags[arg]
+			continue
+		}
+		out[i] = normalizeSuiteArg(suiteDir, cwd, workdir, arg)
+	}
+	return out
+}
+
+func normalizeSuiteArg(suiteDir, cwd, workdir, arg string) string {
+	if arg == "" || strings.Contains(arg, "://") {
+		return arg
+	}
+	pathPart, suffix := splitSelector(arg)
+	if pathPart == "" {
+		return arg
+	}
+	if pathExists(filepath.Join(suiteDir, pathPart)) {
+		return arg
+	}
+	if filepath.IsAbs(pathPart) {
+		if rel, ok := relWithin(suiteDir, pathPart); ok {
+			return filepath.ToSlash(rel) + suffix
+		}
+		return arg
+	}
+	if cwd != "" && cwd != suiteDir {
+		candidate := filepath.Join(cwd, pathPart)
+		if pathExists(candidate) {
+			if rel, ok := relWithin(suiteDir, candidate); ok {
+				return filepath.ToSlash(rel) + suffix
+			}
+		}
+	}
+	trimmed := strings.TrimPrefix(filepath.ToSlash(pathPart), "./")
+	if trimmed == workdir || trimmed == workdir+"/" {
+		return "." + suffix
+	}
+	if strings.HasPrefix(trimmed, workdir+"/") {
+		return strings.TrimPrefix(trimmed, workdir+"/") + suffix
+	}
+	return arg
+}
+
+func splitSelector(arg string) (pathPart, suffix string) {
+	idx := strings.IndexByte(arg, ':')
+	if idx <= 0 {
+		return arg, ""
+	}
+	return arg[:idx], arg[idx:]
+}
+
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+func relWithin(base, target string) (string, bool) {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return "", false
+	}
+	if rel == "." {
+		return ".", true
+	}
+	if !filepath.IsLocal(rel) {
+		return "", false
+	}
+	return rel, true
 }
 
 func noEmpty(field string, values []string) error {

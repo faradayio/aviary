@@ -20,7 +20,9 @@ import (
 
 	"github.com/faradayio/aviary/internal/compose"
 	"github.com/faradayio/aviary/internal/config"
+	"github.com/faradayio/aviary/internal/dockerdesktop"
 	"github.com/faradayio/aviary/internal/registry"
+	"github.com/faradayio/aviary/internal/snapshot"
 	"github.com/faradayio/aviary/internal/workspace"
 )
 
@@ -541,6 +543,53 @@ func suiteConfig() *config.Config {
 	return cfg
 }
 
+func TestTestAnnouncesWhetherInitWillRun(t *testing.T) {
+	t.Run("running", func(t *testing.T) {
+		s, _ := newStack(t, suiteConfig())
+		var stderr bytes.Buffer
+		s.stderr = &stderr
+		if err := s.Test("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		const want = "aviary: test web: init running (the first init in a worktree can take several minutes)\n"
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+		}
+	})
+
+	t.Run("already initialized", func(t *testing.T) {
+		s, rec := newStack(t, suiteConfig())
+		if err := s.markInitialized(true); err != nil {
+			t.Fatal(err)
+		}
+		var stderr bytes.Buffer
+		s.stderr = &stderr
+		if err := s.Test("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stderr.String(), "aviary: test web: init skipped\n") || strings.Contains(stderr.String(), "several minutes") {
+			t.Errorf("stderr = %q, want init skipped and no first-init warning", stderr.String())
+		}
+		for _, call := range rec.calls {
+			if slices.Contains(call, "db:reset") {
+				t.Errorf("init ran even though it was already recorded: %q", call)
+			}
+		}
+	})
+
+	t.Run("suite opts out", func(t *testing.T) {
+		s, _ := newStack(t, suiteConfig())
+		var stderr bytes.Buffer
+		s.stderr = &stderr
+		if err := s.Test("acceptance", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stderr.String(), "aviary: test acceptance: init skipped\n") || strings.Contains(stderr.String(), "several minutes") {
+			t.Errorf("stderr = %q, want init skipped and no first-init warning", stderr.String())
+		}
+	})
+}
+
 func TestTestRunsInitThenNeedsThenTheSuite(t *testing.T) {
 	s, rec := newStack(t, suiteConfig())
 
@@ -726,5 +775,366 @@ func TestRemoveVolumesWaitsForARunningInit(t *testing.T) {
 	}
 	if entryFor(t, s).InitializedAt != nil {
 		t.Error("volumes removed after init finished, but the stack is still marked initialized")
+	}
+}
+
+func TestVaultAndHostEnvPassToComposeWithoutLeakingToEnvOutput(t *testing.T) {
+	root := tempDir(t)
+	adc := filepath.Join(root, "adc.json")
+	if err := os.WriteFile(adc, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeDefinition(t, root, `compose:
+  files: [compose.yaml]
+ports: [postgres]
+require_env: [VAULT_TOKEN, ADC_PATH]
+vault:
+  addr: https://vault2.faraday.ai
+host_env:
+  ADC_PATH:
+    path: `+adc+`
+    required: true
+`)
+	unset(t, "VAULT_TOKEN")
+	unset(t, "ADC_PATH")
+
+	s, err := Load(root, "", Options{
+		Registry: testRegistry(t),
+		VaultToken: func(cfg *config.Vault) (string, error) {
+			return "secret-child-token", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := s.Env()["VAULT_TOKEN"]; leaked {
+		t.Error("s.Env() leaked VAULT_TOKEN")
+	}
+	c := s.Compose()
+	if c.Env["VAULT_TOKEN"] != "secret-child-token" || c.Env["VAULT_ADDR"] != "https://vault2.faraday.ai" || c.Env["ADC_PATH"] != adc {
+		t.Errorf("Compose().Env = %v", c.Env)
+	}
+}
+
+func TestSuiteThatWantsPrepareAndInitPreparesOnce(t *testing.T) {
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Prepare: []config.HostStep{{Command: []string{"make", "artifacts"}}},
+		Init:    []config.Step{{Service: "migrate", Command: []string{"rake", "db:reset"}}},
+		Suites: map[string]config.Suite{
+			"api": {Service: "api", Command: []string{"npm", "test"}},
+		},
+	}
+	s, rec := newStack(t, cfg)
+	var prepares int
+	s.hostRunner = func(dir string, extraEnv map[string]string, command []string) error {
+		prepares++
+		return nil
+	}
+
+	if err := s.Test("api", nil); err != nil {
+		t.Fatal(err)
+	}
+	if prepares != 1 {
+		t.Errorf("prepare ran %d times, want 1", prepares)
+	}
+	assertCalls(t, rec,
+		argv(nil, "run", "--rm", "migrate", "rake", "db:reset"),
+		argv(nil, "run", "--rm", "api", "npm", "test"),
+	)
+}
+
+func TestContainerSuiteEnvTravelsInComposeEnvironmentNotArgv(t *testing.T) {
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Ports:   []string{"postgres"},
+		Suites: map[string]config.Suite{
+			"api": {
+				Service: "api",
+				Init:    new(bool),
+				Prepare: new(bool),
+				Env: map[string]string{
+					"DATABASE_URL": "postgresql://postgres@postgres:${AVIARY_PORT_POSTGRES}/db",
+					"PRICE":        "$$5",
+				},
+				Command: []string{"npm", "test"},
+			},
+		},
+	}
+	s, _ := newStack(t, cfg)
+	var gotArgs []string
+	var gotEnv map[string]string
+	s.runner = func(c compose.Stack, args ...string) error {
+		gotArgs, gotEnv = args, c.Env
+		return nil
+	}
+
+	if err := s.Test("api", nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"run", "--rm", "--env", "DATABASE_URL", "--env", "PRICE", "api", "npm", "test"}; !slices.Equal(gotArgs, want) {
+		t.Errorf("args = %q, want %q", gotArgs, want)
+	}
+	if want := "postgresql://postgres@postgres:" + strconv.Itoa(s.Entry.Ports["postgres"]) + "/db"; gotEnv["DATABASE_URL"] != want {
+		t.Errorf("DATABASE_URL = %q, want %q", gotEnv["DATABASE_URL"], want)
+	}
+	if gotEnv["PRICE"] != "$5" {
+		t.Errorf("PRICE = %q, want $5", gotEnv["PRICE"])
+	}
+}
+
+func TestPrepareAndHostSuiteExpandPortVariables(t *testing.T) {
+	noInit := false
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Ports:   []string{"postgres"},
+		Prepare: []config.HostStep{{Command: []string{"node", "scripts/copy-api-artifacts.mts", "--all"}}},
+		Suites: map[string]config.Suite{
+			"investigator": {
+				Host:    true,
+				Workdir: "src/investigator",
+				Needs:   []string{"postgres"},
+				Init:    &noInit,
+				Env: map[string]string{
+					"INVESTIGATOR_TEST_DATABASE_URL": "postgresql://postgres@127.0.0.1:${AVIARY_PORT_POSTGRES}/postgres",
+				},
+				Command: []string{"uv", "run", "pytest"},
+			},
+		},
+	}
+	s, rec := newStack(t, cfg)
+	type hostCall struct {
+		dir string
+		env map[string]string
+		cmd []string
+	}
+	var hostCalls []hostCall
+	s.hostRunner = func(dir string, extraEnv map[string]string, command []string) error {
+		hostCalls = append(hostCalls, hostCall{dir, maps.Clone(extraEnv), slices.Clone(command)})
+		return nil
+	}
+
+	if err := s.Test("investigator", []string{"--", "-k", "runs"}); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, rec, argv(nil, "up", "--detach", "--wait", "postgres"))
+	if len(hostCalls) != 2 {
+		t.Fatalf("hostCalls = %+v, want prepare + suite", hostCalls)
+	}
+	if hostCalls[0].dir != "/work/wt" || !slices.Equal(hostCalls[0].cmd, []string{"node", "scripts/copy-api-artifacts.mts", "--all"}) {
+		t.Errorf("prepare call = %+v", hostCalls[0])
+	}
+	wantPort := strconv.Itoa(s.Entry.Ports["postgres"])
+	if hostCalls[1].dir != "/work/wt/src/investigator" ||
+		hostCalls[1].env["INVESTIGATOR_TEST_DATABASE_URL"] != "postgresql://postgres@127.0.0.1:"+wantPort+"/postgres" ||
+		!slices.Equal(hostCalls[1].cmd, []string{"uv", "run", "pytest", "-k", "runs"}) {
+		t.Errorf("suite call = %+v", hostCalls[1])
+	}
+}
+
+type fakeArchiver struct {
+	volumes map[string]string
+}
+
+func (f *fakeArchiver) SaveVolume(vol snapshot.Volume, archivePath string) error {
+	return os.WriteFile(archivePath, []byte(f.volumes[vol.DockerName]), 0o600)
+}
+
+func (f *fakeArchiver) RestoreVolume(project string, vol snapshot.Volume, archivePath string) error {
+	raw, err := os.ReadFile(archivePath)
+	if err != nil {
+		return err
+	}
+	f.volumes[vol.DockerName] = string(raw)
+	return nil
+}
+
+func TestSnapshotSavesOnFirstInitRestoresExactAndRunsAfterRestoreOnStampChange(t *testing.T) {
+	arch := &fakeArchiver{volumes: map[string]string{}}
+	store := &snapshot.Store{Dir: t.TempDir(), Archiver: arch}
+	reg := testRegistry(t)
+
+	makeWorktree := func(name, schema string) (*Stack, *recorder) {
+		root := tempDir(t)
+		if err := os.WriteFile(filepath.Join(root, "seed.sql"), []byte("INSERT 1;\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "structure.sql"), []byte(schema), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg := &config.Config{
+			Compose:      config.Compose{Files: []string{"compose.yaml"}},
+			Init:         []config.Step{{Service: "diamond", Command: []string{"rake", "db:reset"}}},
+			AfterRestore: []config.Step{{Service: "diamond", Command: []string{"rake", "db:migrate"}}},
+			Snapshot: &config.Snapshot{
+				Volumes:    []string{"postgres"},
+				KeyFiles:   []string{"seed.sql"},
+				StampFiles: []string{"structure.sql"},
+			},
+		}
+		ws := workspace.Workspace{Root: root, Definition: root, Slug: name}
+		entry, err := reg.Allocate(ws.Project(), ws.Root, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := &recorder{}
+		s := &Stack{
+			Config:    cfg,
+			Workspace: ws,
+			Cwd:       root,
+			Entry:     entry,
+			registry:  reg,
+			snapshots: store,
+			stderr:    io.Discard,
+			runner: func(c compose.Stack, args ...string) error {
+				if slices.Equal(args, []string{"run", "--rm", "diamond", "rake", "db:reset"}) {
+					arch.volumes[c.Project+"_postgres"] = "seeded-v1"
+				}
+				if slices.Equal(args, []string{"run", "--rm", "diamond", "rake", "db:migrate"}) {
+					arch.volumes[c.Project+"_postgres"] += "+migrated-v2"
+				}
+				return rec.run(c, args...)
+			},
+			resolver: func(c compose.Stack) (*compose.Resolved, error) {
+				return &compose.Resolved{
+					Services: map[string]compose.ResolvedService{
+						"postgres": {
+							Image:   "postgis/postgis:17-3.5-alpine",
+							Volumes: []compose.ResolvedMount{{Type: "volume", Source: "postgres"}},
+						},
+					},
+					Volumes: map[string]compose.ResolvedVolume{
+						"postgres": {Name: c.Project + "_postgres"},
+					},
+				}, nil
+			},
+		}
+		return s, rec
+	}
+
+	// First worktree misses the cache, runs init, checkpoints down, and saves.
+	wt1, rec1 := makeWorktree("wt1-111111", "CREATE TABLE t (id int);\n")
+	if err := wt1.Init(false); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec1.calls) != 2 || !slices.Contains(rec1.calls[0], "db:reset") || !slices.Contains(rec1.calls[1], "down") {
+		t.Fatalf("wt1 calls = %q, want db:reset then down", rec1.calls)
+	}
+
+	// Second worktree on the same schema restores directly with zero init steps.
+	wt2, rec2 := makeWorktree("wt2-222222", "CREATE TABLE t (id int);\n")
+	if err := wt2.Init(false); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec2.calls) != 1 || !slices.Contains(rec2.calls[0], "down") {
+		t.Fatalf("wt2 calls = %q, want only down before restore", rec2.calls)
+	}
+	if got := arch.volumes["aviary-wt2-222222_postgres"]; got != "seeded-v1" {
+		t.Fatalf("wt2 volume = %q, want seeded-v1", got)
+	}
+
+	// Third worktree on a newer schema restores v1, runs after_restore, and saves v2.
+	wt3, rec3 := makeWorktree("wt3-333333", "CREATE TABLE t (id int, name text);\n")
+	if err := wt3.Init(false); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec3.calls) != 3 || !slices.Contains(rec3.calls[1], "db:migrate") {
+		t.Fatalf("wt3 calls = %q, want down, db:migrate, down", rec3.calls)
+	}
+	if got := arch.volumes["aviary-wt3-333333_postgres"]; got != "seeded-v1+migrated-v2" {
+		t.Fatalf("wt3 volume = %q, want seeded-v1+migrated-v2", got)
+	}
+
+	// Fourth worktree on that same newer schema now hits v2 directly without after_restore.
+	wt4, rec4 := makeWorktree("wt4-444444", "CREATE TABLE t (id int, name text);\n")
+	if err := wt4.Init(false); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec4.calls) != 1 || !slices.Contains(rec4.calls[0], "down") {
+		t.Fatalf("wt4 calls = %q, want exact hit without after_restore", rec4.calls)
+	}
+	if got := arch.volumes["aviary-wt4-444444_postgres"]; got != "seeded-v1+migrated-v2" {
+		t.Fatalf("wt4 volume = %q, want seeded-v1+migrated-v2", got)
+	}
+}
+
+func TestTestStripsSuiteWorkdirPrefixAndWarnsDockerDesktopOnlyForContainers(t *testing.T) {
+	root := tempDir(t)
+	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte("x-fdy:\n  platform: linux/amd64\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	noInit := false
+	noPrepare := false
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Suites: map[string]config.Suite{
+			"popsicle": {
+				Host:    true,
+				Workdir: "src/popsicle",
+				Init:    &noInit,
+				Prepare: &noPrepare,
+				Command: []string{"pnpm", "test"},
+			},
+			"model_train-file": {
+				Service: "model_train",
+				Workdir: "workers/model_train",
+				Init:    &noInit,
+				Prepare: &noPrepare,
+				Command: []string{"uv", "run", "pytest"},
+			},
+		},
+	}
+	ws := workspace.Workspace{Root: root, Definition: root, Slug: "wt-abc123"}
+	reg := testRegistry(t)
+	entry, err := reg.Allocate(ws.Project(), ws.Root, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	var hostCmd []string
+	var composeArgs []string
+	s := &Stack{
+		Config:    cfg,
+		Workspace: ws,
+		Cwd:       root,
+		Entry:     entry,
+		registry:  reg,
+		stderr:    &stderr,
+		dockerSettings: &dockerdesktop.Settings{
+			UseVirtualizationFramework:        false,
+			UseVirtualizationFrameworkRosetta: true,
+			MemoryMiB:                         6144,
+		},
+		hostRunner: func(dir string, extraEnv map[string]string, command []string) error {
+			hostCmd = command
+			return nil
+		},
+		runner: func(c compose.Stack, args ...string) error {
+			composeArgs = args
+			return nil
+		},
+	}
+
+	// Pure host suite with no container needs emits no Docker Desktop warning.
+	if err := s.Test("popsicle", []string{"--", "src/popsicle/src/js/Foo.test.tsx"}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(hostCmd, []string{"pnpm", "test", "src/js/Foo.test.tsx"}) {
+		t.Errorf("popsicle host command = %q", hostCmd)
+	}
+	if strings.Contains(stderr.String(), "warning:") {
+		t.Errorf("pure host suite emitted Docker warning: %s", stderr.String())
+	}
+
+	// Container suite strips prefix and emits the Rosetta + memory warnings.
+	stderr.Reset()
+	if err := s.Test("model_train-file", []string{"--", "workers/model_train/tests/citus/test_insights.py::test_x"}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(composeArgs, []string{"run", "--rm", "model_train", "uv", "run", "pytest", "tests/citus/test_insights.py::test_x"}) {
+		t.Errorf("container suite args = %q", composeArgs)
+	}
+	if !strings.Contains(stderr.String(), "Apple Virtualization framework") || !strings.Contains(stderr.String(), "6144 MiB") {
+		t.Errorf("container suite stderr missing Docker Desktop warnings:\n%s", stderr.String())
 	}
 }

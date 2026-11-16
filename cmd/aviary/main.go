@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/faradayio/aviary/internal/compose"
+	"github.com/faradayio/aviary/internal/config"
 	"github.com/faradayio/aviary/internal/registry"
 	"github.com/faradayio/aviary/internal/stack"
 	"github.com/faradayio/aviary/internal/workspace"
@@ -50,6 +52,8 @@ type app struct {
 	listProjects func() ([]compose.Project, error)
 	downProject  func(name string) error
 	runCompose   func(c compose.Stack, args ...string) error
+	runHost      func(dir string, extraEnv map[string]string, command []string) error
+	vaultToken   func(cfg *config.Vault) (string, error)
 	branch       func(root string) string
 }
 
@@ -59,6 +63,7 @@ func newApp() *app {
 		listProjects: compose.ListProjects,
 		downProject:  compose.DownProject,
 		runCompose:   compose.Stack.Run,
+		runHost:      compose.RunHost,
 		branch:       workspace.Branch,
 	}
 }
@@ -86,11 +91,12 @@ func (a *app) rootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.config, "config", "",
 		"directory holding aviary.yml when the worktree has none (default $AVIARY_CONFIG)")
 	root.AddCommand(
-		a.passthrough("up [--build] [service...]", "Start the stack, or the named services, and wait until healthy", startsContainers, "up", "--detach", "--wait"),
+		a.upCmd(),
 		a.downCmd(),
 		a.testCmd(),
 		a.initCmd(),
-		a.passthrough("run <service> [command...]", "Run a one-off command in a fresh container", startsContainers, "run", "--rm"),
+		a.pullCmd(),
+		a.runCmd(),
 		a.passthrough("exec <service> <command...>", "Run a command in a running container", inspectsOnly, "exec"),
 		a.passthrough("ps", "List this stack's containers", inspectsOnly, "ps"),
 		a.passthrough("logs [service...]", "Show container logs", inspectsOnly, "logs"),
@@ -134,7 +140,104 @@ func (a *app) loadStack(opts stack.Options) (*stack.Stack, error) {
 		return nil, err
 	}
 	opts.Runner = a.runCompose
+	opts.HostRunner = a.runHost
+	opts.VaultToken = a.vaultToken
 	return stack.Load(cwd, a.configDir(), opts)
+}
+
+func (a *app) upCmd() *cobra.Command {
+	cmd := a.passthrough("up [--build] [service...]", "Start the stack, or the named services, and wait until healthy", startsContainers, "up", "--detach", "--wait")
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s, err := a.loadStack(startsContainers)
+		if err != nil {
+			return err
+		}
+		s.WarnDockerDesktop()
+		if err := s.Prepare(); err != nil {
+			return err
+		}
+		return a.runCompose(s.Compose(), append([]string{"up", "--detach", "--wait"}, args...)...)
+	}
+	return cmd
+}
+
+// pullCmd pulls images across every profile without registering the stack or
+// checking require_env. For an unregistered stack, s.Entry.Ports is empty, so
+// compose files that guard port mappings with `${AVIARY_PORT_X:?...}` would
+// refuse to parse; fill any unallocated configured port with its BasePort
+// placeholder for interpolation only.
+func (a *app) pullCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "pull [service...]",
+		Short: "Pull the stack's images across every profile",
+		Long: `Pull the stack's images across every profile (or for the named services).
+When gcloud Application Default Credentials are available on the host,
+CLOUDSDK_AUTH_ACCESS_TOKEN is set from them so Docker's gcloud credential
+helper works unattended without an interactive gcloud reauthentication prompt.`,
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+				return cmd.Help()
+			}
+			s, err := a.loadStack(inspectsOnly)
+			if err != nil {
+				return err
+			}
+			c := s.Compose()
+			c.Profiles = []string{"*"}
+			base := registry.BasePort(s.Workspace.Project())
+			for i, name := range s.Config.Ports {
+				key := "AVIARY_PORT_" + strings.ToUpper(name)
+				if c.Env[key] == "" {
+					c.Env[key] = fmt.Sprint(base + i)
+				}
+			}
+			if os.Getenv("CLOUDSDK_AUTH_ACCESS_TOKEN") == "" {
+				if tok := gcloudADCToken(); tok != "" {
+					c.Env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = tok
+				}
+			}
+			return a.runCompose(c, append([]string{"pull", "--quiet"}, args...)...)
+		},
+	}
+}
+
+// gcloudADCToken prints an access token from gcloud's Application Default
+// Credentials, or returns empty when there are none, without starting gcloud
+// on machines that never ran `gcloud auth application-default login`.
+func gcloudADCToken() string {
+	configDir := os.Getenv("CLOUDSDK_CONFIG")
+	if configDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		configDir = filepath.Join(home, ".config", "gcloud")
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "application_default_credentials.json")); err != nil {
+		return ""
+	}
+	out, err := exec.Command("gcloud", "auth", "application-default", "print-access-token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (a *app) runCmd() *cobra.Command {
+	cmd := a.passthrough("run <service> [command...]", "Run a one-off command in a fresh container", startsContainers, "run", "--rm")
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s, err := a.loadStack(startsContainers)
+		if err != nil {
+			return err
+		}
+		s.WarnDockerDesktop()
+		if err := s.Prepare(); err != nil {
+			return err
+		}
+		return a.runCompose(s.Compose(), append([]string{"run", "--rm"}, args...)...)
+	}
+	return cmd
 }
 
 // passthrough makes a command that forwards its arguments to one compose
@@ -154,6 +257,9 @@ Every argument is passed to docker compose unchanged, so aviary flags such as
 			s, err := a.loadStack(opts)
 			if err != nil {
 				return err
+			}
+			if !opts.SkipRequireEnv {
+				s.WarnDockerDesktop()
 			}
 			return a.runCompose(s.Compose(), slices.Concat(sub, args)...)
 		},
@@ -175,6 +281,9 @@ func (a *app) composeCmd() *cobra.Command {
 		s, err := a.loadStack(opts)
 		if err != nil {
 			return err
+		}
+		if !opts.SkipRequireEnv {
+			s.WarnDockerDesktop()
 		}
 		run := func() error { return a.runCompose(s.Compose(), args...) }
 		if sub == "down" && removesVolumes(rest) {
@@ -253,10 +362,13 @@ func (a *app) testCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "test [suite [-- args...]]",
 		Short: "Run a named test suite, starting what it needs first",
-		Long: `Run a named test suite from aviary.yml. The stack's init steps run first if
+		Long: `Run a named test suite from aviary.yml. It first prints whether init will
+run; the first init in a worktree can take several minutes. The prepare steps
+run on the host unless the suite sets prepare: false, the init steps run if
 the suite wants them and they have not run yet, the services the suite needs
 are started and waited on, and the suite's command runs in a fresh container
-with any extra args appended. The exit status is the suite's own.
+(or on the host for host: true suites) with any extra args appended. The exit
+status is the suite's own.
 
 With no suite, list the suites aviary.yml defines.`,
 		// Arguments after the suite name go to the suite's command, so cobra

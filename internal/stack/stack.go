@@ -17,30 +17,51 @@ import (
 
 	"github.com/faradayio/aviary/internal/compose"
 	"github.com/faradayio/aviary/internal/config"
+	"github.com/faradayio/aviary/internal/dockerdesktop"
 	"github.com/faradayio/aviary/internal/registry"
+	"github.com/faradayio/aviary/internal/snapshot"
+	"github.com/faradayio/aviary/internal/vault"
 	"github.com/faradayio/aviary/internal/workspace"
 )
 
 type Stack struct {
 	Config    *config.Config
 	Workspace workspace.Workspace
+	// Cwd is the caller's working directory, used to rewrite repo-relative
+	// test path arguments against a suite's Workdir.
+	Cwd string
 	// Entry is this stack's registry entry: its host ports and whether
 	// aviary has recorded that its init steps ran. It is the zero Entry,
 	// with no ports, when Load ran with NoAllocate for a stack that is not
 	// registered.
 	Entry    registry.Entry
 	registry *registry.Registry
+	// resolvedEnv holds credentials and host file paths resolved during
+	// Load (Vault token, host_env paths), added to compose invocations
+	// without appearing in `aviary env` output.
+	resolvedEnv map[string]string
 	// runner is Options.Runner.
 	runner func(c compose.Stack, args ...string) error
+	// resolver is Options.Resolver.
+	resolver func(c compose.Stack) (*compose.Resolved, error)
+	// hostRunner is Options.HostRunner.
+	hostRunner func(dir string, extraEnv map[string]string, command []string) error
+	// snapshots caches seeded volumes when Config.Snapshot is set.
+	snapshots *snapshot.Store
+	// dockerSettings holds local Docker Desktop settings on Apple silicon.
+	dockerSettings *dockerdesktop.Settings
+	warnedDocker   bool
+	// prepared is set once this Stack has run the prepare steps.
+	prepared bool
 	// stderr receives aviary's progress lines for init steps.
 	stderr io.Writer
 }
 
 // Options adjusts how Load builds a stack.
 type Options struct {
-	// SkipRequireEnv loads the stack without checking require_env, for
-	// commands that never start or run a container and so never hand the
-	// required variables to one.
+	// SkipRequireEnv loads the stack without resolving vault/host_env or
+	// checking require_env, for commands that never start or run a
+	// container and so never hand the required variables to one.
 	SkipRequireEnv bool
 	// NoAllocate reads the stack's registry entry instead of allocating,
 	// for commands that only inspect or stop a stack and so must not
@@ -53,14 +74,24 @@ type Options struct {
 	// defaults to compose.Stack.Run; tests replace it to record argv
 	// instead of calling Docker.
 	Runner func(c compose.Stack, args ...string) error
+	// Resolver resolves `docker compose config --format json` for snapshot
+	// identity calculation. Defaults to compose.Stack.Config.
+	Resolver func(c compose.Stack) (*compose.Resolved, error)
+	// HostRunner runs a command on the host in dir. It defaults to
+	// compose.RunHost; tests replace it to record host commands.
+	HostRunner func(dir string, extraEnv map[string]string, command []string) error
+	// SnapshotStore overrides the default XDG snapshot cache during tests.
+	SnapshotStore *snapshot.Store
+	// VaultToken overrides Vault token minting during tests. When nil and
+	// cfg.Vault is set, vault.NewClient(cfg.Vault).Token is called.
+	VaultToken func(cfg *config.Vault) (string, error)
 }
 
 // Load builds the stack for the worktree containing cwd, allocating any host
 // ports it does not have yet unless opts.NoAllocate is set. configDir is the
 // external definition directory from --config or AVIARY_CONFIG, or empty when
-// neither is set. Unless opts.SkipRequireEnv is set, every name in
-// require_env must be set in the host environment; otherwise Load fails
-// listing all the missing names, before touching the registry.
+// neither is set. Unless opts.SkipRequireEnv is set, vault, host_env and
+// require_env are resolved and checked before touching the registry.
 func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	ws, err := workspace.Detect(cwd, configDir)
 	if err != nil {
@@ -70,9 +101,26 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
+	defFile := filepath.Join(ws.Definition, config.FileName)
+	resolvedEnv := map[string]string{}
 	if !opts.SkipRequireEnv {
-		if err := checkRequiredEnv(cfg.RequireEnv); err != nil {
-			return nil, fmt.Errorf("%s: %w", filepath.Join(ws.Definition, config.FileName), err)
+		if cfg.Vault != nil {
+			mint := opts.VaultToken
+			if mint == nil {
+				mint = defaultVaultToken
+			}
+			token, err := mint(cfg.Vault)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", defFile, err)
+			}
+			resolvedEnv["VAULT_ADDR"] = cfg.Vault.Addr
+			resolvedEnv["VAULT_TOKEN"] = token
+		}
+		if err := resolveHostEnv(cfg.HostEnv, resolvedEnv); err != nil {
+			return nil, fmt.Errorf("%s: %w", defFile, err)
+		}
+		if err := checkRequiredEnv(cfg.RequireEnv, resolvedEnv); err != nil {
+			return nil, fmt.Errorf("%s: %w", defFile, err)
 		}
 	}
 	reg := opts.Registry
@@ -95,15 +143,109 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	if runner == nil {
 		runner = compose.Stack.Run
 	}
-	return &Stack{Config: cfg, Workspace: ws, Entry: entry, registry: reg, runner: runner, stderr: os.Stderr}, nil
+	resolver := opts.Resolver
+	if resolver == nil {
+		resolver = compose.Stack.Config
+	}
+	hostRunner := opts.HostRunner
+	if hostRunner == nil {
+		hostRunner = compose.RunHost
+	}
+	callerDir := cwd
+	if abs, err := filepath.Abs(cwd); err == nil {
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			callerDir = resolved
+		} else {
+			callerDir = abs
+		}
+	}
+	var dockerSettings *dockerdesktop.Settings
+	if !opts.SkipRequireEnv {
+		dockerSettings = dockerdesktop.LoadDefault()
+	}
+	return &Stack{
+		Config:         cfg,
+		Workspace:      ws,
+		Cwd:            callerDir,
+		Entry:          entry,
+		registry:       reg,
+		resolvedEnv:    resolvedEnv,
+		runner:         runner,
+		resolver:       resolver,
+		hostRunner:     hostRunner,
+		snapshots:      opts.SnapshotStore,
+		dockerSettings: dockerSettings,
+		stderr:         os.Stderr,
+	}, nil
+}
+
+// WarnDockerDesktop prints one-line warnings to stderr at most once when
+// linux/amd64 compose services run on Apple silicon without Rosetta or enough
+// VM memory.
+func (s *Stack) WarnDockerDesktop() {
+	if s.warnedDocker || s.dockerSettings == nil {
+		return
+	}
+	s.warnedDocker = true
+	hasAmd64 := dockerdesktop.ComposeFilesSpecifyLinuxAmd64(s.Workspace.Definition, s.Config.Compose.Files)
+	for _, w := range s.dockerSettings.Warnings(hasAmd64) {
+		fmt.Fprintf(s.stderr, "aviary: warning: %s\n", w)
+	}
+}
+
+func defaultVaultToken(cfg *config.Vault) (string, error) {
+	client, err := vault.NewClient(cfg)
+	if err != nil {
+		return "", err
+	}
+	return client.Token()
+}
+
+func resolveHostEnv(specs map[string]config.HostFile, out map[string]string) error {
+	for _, name := range slices.Sorted(maps.Keys(specs)) {
+		if os.Getenv(name) != "" || out[name] != "" {
+			continue
+		}
+		spec := specs[name]
+		expanded, err := expandHome(spec.Path)
+		if err != nil {
+			return err
+		}
+		if info, err := os.Stat(expanded); err == nil && !info.IsDir() {
+			out[name] = expanded
+			continue
+		}
+		if spec.Required {
+			msg := fmt.Sprintf("host_env %s: %s does not exist", name, expanded)
+			if spec.Hint != "" {
+				msg += " (" + spec.Hint + ")"
+			}
+			return fmt.Errorf("%s", msg)
+		}
+	}
+	return nil
+}
+
+func expandHome(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
 }
 
 // checkRequiredEnv treats an empty variable as missing: an empty credential
 // fails the same way an unset one does, only later and less clearly.
-func checkRequiredEnv(names []string) error {
+func checkRequiredEnv(names []string, resolved map[string]string) error {
 	var missing []string
 	for _, name := range names {
-		if os.Getenv(name) == "" {
+		if os.Getenv(name) == "" && resolved[name] == "" {
 			missing = append(missing, name)
 		}
 	}
@@ -113,8 +255,10 @@ func checkRequiredEnv(names []string) error {
 	return nil
 }
 
-// Env is the environment aviary adds for compose interpolation and for
-// processes that want to reach the stack from the host.
+// Env is the public environment aviary adds for compose interpolation and for
+// processes that want to reach the stack from the host (`aviary env`). Secrets
+// such as VAULT_TOKEN are deliberately excluded so `aviary env` never prints
+// credentials.
 func (s *Stack) Env() map[string]string {
 	env := map[string]string{
 		"COMPOSE_PROJECT_NAME": s.Workspace.Project(),
@@ -127,6 +271,27 @@ func (s *Stack) Env() map[string]string {
 	}
 	for name, port := range s.Entry.Ports {
 		env["AVIARY_PORT_"+strings.ToUpper(name)] = strconv.Itoa(port)
+	}
+	return env
+}
+
+// composeEnv is Env plus the resolved credentials, plus extra with each value
+// interpolated against those (not against other extra values) and then the
+// host environment. `$$` is a literal `$`, as in compose files.
+func (s *Stack) composeEnv(extra map[string]string) map[string]string {
+	base := s.Env()
+	maps.Copy(base, s.resolvedEnv)
+	env := maps.Clone(base)
+	for k, v := range extra {
+		env[k] = os.Expand(v, func(name string) string {
+			if name == "$" {
+				return "$"
+			}
+			if val, ok := base[name]; ok {
+				return val
+			}
+			return os.Getenv(name)
+		})
 	}
 	return env
 }
@@ -156,7 +321,7 @@ func (s *Stack) envLines(line func(k, v string) string) []string {
 }
 
 // Compose is the compose invocation for this stack with the stack-wide
-// profiles.
+// profiles and any resolved credentials.
 func (s *Stack) Compose() compose.Stack {
 	return compose.Stack{
 		Project:    s.Workspace.Project(),
@@ -164,7 +329,7 @@ func (s *Stack) Compose() compose.Stack {
 		Definition: s.Workspace.Definition,
 		Files:      s.Config.Compose.Files,
 		Profiles:   s.Config.Compose.Profiles,
-		Env:        s.Env(),
+		Env:        s.composeEnv(nil),
 	}
 }
 
@@ -174,6 +339,34 @@ func (s *Stack) run(extraProfiles []string, args ...string) error {
 	c := s.Compose()
 	c.Profiles = slices.Concat(c.Profiles, extraProfiles)
 	return s.runner(c, args...)
+}
+
+// Prepare runs the host prepare steps from aviary.yml in the worktree root,
+// under the stack's lock so two aviary commands in one worktree never run
+// them at once.
+func (s *Stack) Prepare() error {
+	unlock, err := s.registry.LockProject(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.prepareLocked()
+}
+
+// prepareLocked runs the prepare steps at most once per Stack, so a command
+// that prepares and then inits runs them once. The caller holds the lock.
+func (s *Stack) prepareLocked() error {
+	if s.prepared {
+		return nil
+	}
+	for i, step := range s.Config.Prepare {
+		desc := strings.Join(step.Command, " ")
+		if err := s.hostRunner(s.Workspace.Root, s.composeEnv(nil), step.Command); err != nil {
+			return fmt.Errorf("prepare step %d (%s) failed: %v", i+1, desc, err)
+		}
+	}
+	s.prepared = true
+	return nil
 }
 
 // Init seeds the stack's volumes by running each init step in a fresh
@@ -196,10 +389,92 @@ func (s *Stack) Init(force bool) error {
 	if s.Entry.InitializedAt != nil && !force {
 		return nil
 	}
+	s.WarnDockerDesktop()
+	if err := s.prepareLocked(); err != nil {
+		return err
+	}
+	if s.Config.Snapshot != nil {
+		return s.initWithSnapshot(force)
+	}
 	if err := s.runSteps("init", s.Config.Init); err != nil {
 		return err
 	}
 	return s.markInitialized(true)
+}
+
+func (s *Stack) initWithSnapshot(force bool) error {
+	resolveCompose := s.Compose()
+	resolveCompose.Profiles = []string{"*"}
+	resolveFn := s.resolver
+	if resolveFn == nil {
+		resolveFn = compose.Stack.Config
+	}
+	resolved, err := resolveFn(resolveCompose)
+	if err != nil {
+		return fmt.Errorf("resolving compose config for snapshot: %w", err)
+	}
+	id, err := snapshot.BuildIdentity(s.Workspace.Project(), s.Workspace.Root, s.Config.Snapshot, s.Config.Init, resolved)
+	if err != nil {
+		return err
+	}
+	store := s.snapshots
+	if store == nil {
+		store, err = snapshot.OpenDefault()
+		if err != nil {
+			return err
+		}
+	}
+
+	if !force {
+		hit, err := store.Lookup(id, len(s.Config.AfterRestore) > 0)
+		if err != nil {
+			return err
+		}
+		if hit != nil {
+			restoreStart := time.Now()
+			if hit.Exact {
+				fmt.Fprintf(s.stderr, "aviary: init: restoring snapshot %s\n", hit.Stamp)
+			} else {
+				fmt.Fprintf(s.stderr, "aviary: init: restoring snapshot %s (schema changed; after_restore will run)\n", hit.Stamp)
+			}
+			if err := s.run(nil, "down", "--remove-orphans"); err != nil {
+				return fmt.Errorf("stopping stack before snapshot restore: %v", err)
+			}
+			if err := store.Restore(id, hit.Stamp); err != nil {
+				return err
+			}
+			fmt.Fprintf(s.stderr, "aviary: init: snapshot restored in %s\n", seconds(time.Since(restoreStart)))
+			if !hit.Exact {
+				if err := s.runSteps("after_restore", s.Config.AfterRestore); err != nil {
+					return err
+				}
+				if err := s.checkpointAndSaveSnapshot(store, id); err != nil {
+					return err
+				}
+			}
+			return s.markInitialized(true)
+		}
+	}
+
+	if err := s.runSteps("init", s.Config.Init); err != nil {
+		return err
+	}
+	if err := s.checkpointAndSaveSnapshot(store, id); err != nil {
+		return err
+	}
+	return s.markInitialized(true)
+}
+
+func (s *Stack) checkpointAndSaveSnapshot(store *snapshot.Store, id *snapshot.Identity) error {
+	if err := s.run(nil, "down", "--remove-orphans"); err != nil {
+		return fmt.Errorf("stopping stack before saving snapshot: %v", err)
+	}
+	saveStart := time.Now()
+	if err := store.Save(id); err != nil {
+		return err
+	}
+	fmt.Fprintf(s.stderr, "aviary: init: saved snapshot %s in %s\n", id.Stamp, seconds(time.Since(saveStart)))
+	return nil
 }
 
 // runSteps runs steps in order and stops at the first failure. It reports
@@ -230,11 +505,14 @@ func seconds(d time.Duration) string {
 	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
-// Test runs the named suite: init first if the suite wants it, then its
-// needs brought up and healthy, then the suite's command in a fresh
-// container with extra appended (a leading "--" is dropped). The stack-wide
-// and suite profiles apply to both compose calls. A suite that fails returns
-// its status as a *compose.ExitError.
+// Test runs the named suite: prepare steps if wanted, init if wanted, then its
+// needs brought up and healthy, then the suite's command in a fresh container
+// (or on the host when suite.Host is true) with extra appended (a leading "--"
+// is dropped). The stack-wide and suite profiles apply to both compose calls.
+// A suite that fails returns its status as a *compose.ExitError.
+//
+// The first thing it prints is whether init will run. A first init can sit
+// for several minutes before any other output.
 func (s *Stack) Test(name string, extra []string) error {
 	suite, ok := s.Config.Suites[name]
 	if !ok {
@@ -244,10 +522,19 @@ func (s *Stack) Test(name string, extra []string) error {
 		}
 		return fmt.Errorf("no suite %q; available: %s", name, strings.Join(names, ", "))
 	}
+	s.announceTest(name, suite)
+	if suite.WantsPrepare() {
+		if err := s.Prepare(); err != nil {
+			return err
+		}
+	}
 	if suite.WantsInit() {
 		if err := s.Init(false); err != nil {
 			return err
 		}
+	}
+	if len(suite.Needs) > 0 || !suite.Host {
+		s.WarnDockerDesktop()
 	}
 	if len(suite.Needs) > 0 {
 		args := append([]string{"up", "--detach", "--wait"}, suite.Needs...)
@@ -258,8 +545,38 @@ func (s *Stack) Test(name string, extra []string) error {
 	if len(extra) > 0 && extra[0] == "--" {
 		extra = extra[1:]
 	}
-	args := slices.Concat([]string{"run", "--rm", suite.Service}, suite.Command, extra)
-	return s.run(suite.Profiles, args...)
+	callerDir := s.Cwd
+	if callerDir == "" {
+		callerDir = s.Workspace.Root
+	}
+	extra = suite.NormalizeArgs(s.Workspace.Root, callerDir, extra)
+	if suite.Host {
+		dir := s.Workspace.Root
+		if suite.Workdir != "" {
+			dir = filepath.Join(dir, suite.Workdir)
+		}
+		return s.hostRunner(dir, s.composeEnv(suite.Env), slices.Concat(suite.Command, extra))
+	}
+	// `--env KEY` with no value makes compose read the value from its own
+	// environment, so values never appear in the process list.
+	envFlags := make([]string, 0, len(suite.Env)*2)
+	for _, k := range slices.Sorted(maps.Keys(suite.Env)) {
+		envFlags = append(envFlags, "--env", k)
+	}
+	c := s.Compose()
+	c.Profiles = slices.Concat(c.Profiles, suite.Profiles)
+	c.Env = s.composeEnv(suite.Env)
+	return s.runner(c, slices.Concat([]string{"run", "--rm"}, envFlags, []string{suite.Service}, suite.Command, extra)...)
+}
+
+// announceTest names the suite and says whether init will run, before prepare
+// or init, so a quiet first run is not mistaken for a hang.
+func (s *Stack) announceTest(name string, suite config.Suite) {
+	if suite.WantsInit() && s.Entry.InitializedAt == nil {
+		fmt.Fprintf(s.stderr, "aviary: test %s: init running (the first init in a worktree can take several minutes)\n", name)
+		return
+	}
+	fmt.Fprintf(s.stderr, "aviary: test %s: init skipped\n", name)
 }
 
 // SuiteNames returns the stack's suite names, sorted.

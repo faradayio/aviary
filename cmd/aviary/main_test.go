@@ -144,7 +144,7 @@ func TestHelpListsEveryCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"up", "down", "test", "init", "run", "exec", "ps", "logs", "build", "compose", "env", "ls", "gc", "rm", "--config"} {
+	for _, name := range []string{"up", "down", "test", "init", "pull", "run", "exec", "ps", "logs", "build", "compose", "env", "ls", "gc", "rm", "--config"} {
 		if !strings.Contains(out, "  "+name+" ") {
 			t.Errorf("help does not list %s:\n%s", name, out)
 		}
@@ -738,6 +738,38 @@ func TestComposeDownVolumesMarksTheStackUninitialized(t *testing.T) {
 	}
 	if h.entry(t, project).InitializedAt != nil {
 		t.Error("compose down --volumes left the stack marked initialized")
+	}
+}
+
+func TestPullSuppliesPlaceholderPortsWithoutRegisteringOrRequiringEnv(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, `
+compose: {files: [compose.yaml]}
+ports: [postgres, extapiweb_http]
+require_env: [AVIARY_TEST_MISSING]
+`)
+	t.Setenv("AVIARY_TEST_MISSING", "")
+	t.Chdir(root)
+	h := newHarness(t)
+
+	if _, err := h.run(t, "pull", "sojourner"); err != nil {
+		t.Fatalf("aviary pull failed on an unregistered stack: %v", err)
+	}
+	if _, err := os.Stat(h.reg.Path()); !os.IsNotExist(err) {
+		t.Fatalf("aviary pull registered the stack (stat err %v)", err)
+	}
+	if len(h.composed) != 1 {
+		t.Fatalf("compose calls = %v, want 1", h.composed)
+	}
+	call := h.composed[0]
+	if !slices.Equal(call.stack.Profiles, []string{"*"}) {
+		t.Errorf("pull profiles = %v, want [*]", call.stack.Profiles)
+	}
+	if !slices.Equal(call.args, []string{"pull", "--quiet", "sojourner"}) {
+		t.Errorf("pull args = %v, want [pull --quiet sojourner]", call.args)
+	}
+	if call.stack.Env["AVIARY_PORT_EXTAPIWEB_HTTP"] == "" {
+		t.Errorf("pull env missing placeholder AVIARY_PORT_EXTAPIWEB_HTTP: %v", call.stack.Env)
 	}
 }
 

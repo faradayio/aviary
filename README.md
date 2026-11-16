@@ -41,7 +41,7 @@ the first or has to be started by hand with different settings.
 | One stack per machine, fixed host ports             | One stack per worktree, a port set per worktree                                 |
 | Writes into the checkout (`pods/`, mounted sources) | Writes nothing into the worktree; sources are bind-mounted by your compose file |
 | Pods, targets and overlays                          | Compose profiles and extra compose files                                        |
-| Mints a Vault token per service                     | Checks that the variables in `require_env` are set and passes them through      |
+| Mints a Vault token per service                     | Mints one Vault token shared by every stack, and checks `require_env`           |
 | Build and deploy path for production                | Local development and testing only                                              |
 
 cage remains the deploy tool. aviary replaces it only for running a repository
@@ -166,16 +166,59 @@ path, so a worktree at the same path gets the same ports on every machine.
 aviary skips ports another stack holds or something on the machine is
 listening on. A worktree keeps its ports until `aviary rm` or `aviary gc`.
 
-### Required environment
+### Required environment, Vault tokens, and host files
 
 ```yaml
+vault:
+  addr: https://vault.example.com
+  ttl: 8h
+
+host_env:
+  GOOGLE_CREDENTIALS_HOST_PATH:
+    path: ~/.config/gcloud/application_default_credentials.json
+    required: true
+    hint: ask the user to run `gcloud auth application-default login`
+
 require_env: [VAULT_TOKEN]
 ```
 
 Commands that create containers (`up`, `test`, `init`, `run`, `build`, and
-`aviary compose up` or `run`) refuse to start while any of these is unset or
-empty, and name every missing one. The host environment passes through to
-compose, so compose files can interpolate them.
+`aviary compose up` or `run`) resolve credentials in this order before calling
+compose:
+
+1. **`vault`**: a `VAULT_TOKEN` already in the environment wins. When
+   `~/.vault-token` also exists, aviary first checks the variable with
+   `lookup-self` and falls back to `~/.vault-token` if Vault rejects it, since
+   agent shells often inherit stale exports. Otherwise aviary mints a
+   non-renewable child token from `~/.vault-token`, caches it under
+   `$XDG_STATE_HOME/aviary/vault-token.json` (`0600`), and reuses it across
+   worktrees and shells until half of its lease has passed. aviary trusts the
+   cached token's recorded expiry without asking Vault, so commands work
+   offline while it lasts; after `vault token revoke`, delete the cache file.
+   The child token has every policy your login has, and Vault caps its lease
+   at your login's remaining time, so aviary warns when Vault grants less
+   than `ttl`. `VAULT_ADDR` is set to `vault.addr`, overriding the shell's.
+   `VAULT_TOKEN` is passed to compose subprocesses and never printed by
+   `aviary env`.
+2. **`host_env`**: each unset variable is filled with the expanded `path` when
+   that file exists on the host. When `required: true` and the file is missing,
+   aviary stops before touching Docker and prints `hint`.
+3. **`require_env`**: refuses to start while any listed variable is still unset
+   or empty, naming every missing one.
+
+### Prepare steps
+
+```yaml
+prepare:
+  - command: [node, scripts/copy-api-artifacts.mts, --all]
+```
+
+Commands that run code from the worktree (`up`, `init`, `run`, and any suite
+without `prepare: false`) run `prepare` on the host in the worktree root first,
+so gitignored build/codegen inputs exist in fresh worktrees without an extra
+step. The steps run at most once per command and never in two aviary commands
+in one worktree at once. Init runs them even for a suite with
+`prepare: false`, because init steps may need their output.
 
 ### Definitions outside the worktree
 
@@ -231,19 +274,68 @@ suites:
     needs: [postgres]
     command: [npm, run, test:migrations]
     init: false
+  worker-host:
+    host: true
+    workdir: src/worker
+    init: false
+    needs: [postgres]
+    env:
+      TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${AVIARY_PORT_POSTGRES}/postgres
+    command: [uv, run, pytest]
 ```
 
-`aviary test api`:
+`aviary test api` prints one line first, naming the suite and whether init will run or was skipped. The first init in a worktree can take several minutes. Then it:
 
-1. runs the init steps, each as `docker compose run --rm <service> <command>`,
+1. runs `prepare` on the host in the worktree root (skipped with `prepare: false`);
+2. runs the init steps, each as `docker compose run --rm <service> <command>`,
    if init has not run for this stack yet (skipped with `init: false`);
-2. starts `postgres` and `redis` and waits until they are healthy;
-3. runs `npm test` in a fresh `api` container.
+3. starts `postgres` and `redis` and waits until they are healthy;
+4. runs `npm test` in a fresh `api` container (or directly on the host in
+   `workdir` when `host: true`).
+
+A suite's `env` is interpolated against the stack's `AVIARY_*` variables and
+resolved credentials, then the host environment; `$$` is a literal `$`. For
+container suites the values reach compose through its environment, not its
+command line, so they never show up in `ps`.
 
 Arguments after the suite name, with or without a `--`, are appended to its
 command, so `aviary test api -- --grep users` and `aviary test api --help`
-reach the test runner. aviary exits with the suite's status. `aviary test`
-alone lists the suites; `aviary test -h` prints the command's help.
+reach the test runner. When a suite sets `workdir` (either a `host: true` suite
+or a container suite whose working directory mounts that package), path
+arguments pointing inside `workdir` from the worktree root or caller directory
+are rewritten relative to `workdir` (`aviary test api -- src/api/test/foo.ts`
+passes `test/foo.ts`), preserving `:line` and `::test` selectors. aviary exits
+with the suite's status. `aviary test` alone lists the suites; `aviary test -h`
+prints the command's help.
+
+### Volume snapshots
+
+When seeding a database takes minutes, `snapshot` caches the seeded volumes
+under `$XDG_CACHE_HOME/aviary/snapshots` (`~/.cache/aviary/snapshots` by
+default) so later worktrees restore them in seconds:
+
+```yaml
+after_restore:
+  - service: migrate
+    command: [rake, db:migrate]
+snapshot:
+  volumes: [postgres]
+  key_files: [db/seeds.rb, db/reference_data.sql]
+  stamp_files: [db/structure.sql]
+```
+
+The snapshot key hashes the volume names, the images mounting them, the `init`
+steps, and every file or directory in `key_files`. The stamp hashes
+`stamp_files`. On `init` (unless `aviary init --force` is passed):
+
+- **Exact `(key, stamp)` hit**: stops the stack's containers, restores the
+  volumes, and skips both `init` and `after_restore`.
+- **Same `key`, different `stamp`** (when `after_restore` is non-empty):
+  restores the newest cached snapshot for `key`, runs `after_restore`, stops
+  the stack to flush database state, and saves the migrated snapshot under the
+  new `stamp`.
+- **Cache miss** (or `aviary init --force`): runs `init`, stops the stack to
+  flush database state, and saves the snapshot under `(key, stamp)`.
 
 Init runs once per stack, so a new worktree runs it from scratch. Step times
 go to stderr. A failing step stops the sequence, names the step, and leaves
@@ -289,6 +381,9 @@ Run from anywhere inside a worktree. `aviary <command> --help` describes each.
 - `aviary down` stops it and keeps its volumes; `--volumes` removes them too.
 - `aviary test <suite> [args...]` runs a suite; with no suite it lists them.
 - `aviary init [--force]` runs the init steps by hand.
+- `aviary pull [service...]` pulls the stack's images across every profile
+  (using `gcloud` Application Default Credentials automatically when present so
+  GCR pulls never hang on an interactive reauth prompt).
 - `aviary run <service> [command...]` runs a one-off command in a fresh
   container and exits with its status.
 - `aviary exec <service> <command...>` runs a command in a running container.
@@ -460,7 +555,7 @@ and those of similar compose wrappers, map like this:
 | `exec`, `shell`                | `aviary exec <service> <command...>`                                                              |
 | `test`                         | `aviary test <suite>`, with the suites named in `aviary.yml`                                      |
 | `logs`, `build`                | `aviary logs`, `aviary build`                                                                     |
-| `pull`                         | `aviary compose pull`                                                                             |
+| `pull`                         | `aviary pull [service...]`                                                                        |
 | init, seed                     | `aviary init`; `aviary down --volumes` first to start from empty volumes                          |
 | source mount, unmount          | none: the compose files bind-mount the worktree's sources, so each stack always runs its own code |
 | targets, environments          | more files under `compose.files`, or [profiles](#profiles)                                        |

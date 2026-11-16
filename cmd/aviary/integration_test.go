@@ -164,6 +164,123 @@ func TestMinimalExampleEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSnapshotSaveRestoreAndAfterRestoreEndToEnd(t *testing.T) {
+	if out, err := exec.Command("docker", "compose", "version").CombinedOutput(); err != nil {
+		t.Fatalf("the integration test needs docker compose: %v\n%s", err, out)
+	}
+
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "aviary")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	env := append(withoutAviaryVars(os.Environ()),
+		"XDG_STATE_HOME="+filepath.Join(tmp, "state"),
+		"XDG_CACHE_HOME="+filepath.Join(tmp, "cache"),
+	)
+
+	const aviaryYml = `compose:
+  files: [compose.yaml]
+ports: [postgres, redis]
+init:
+  - service: client
+    command: [psql, -f, /src/seed.sql]
+after_restore:
+  - service: client
+    command: [psql, -f, /src/migrate.sql]
+snapshot:
+  volumes: [postgres]
+  key_files: [seed.sql]
+  stamp_files: [schema.sql]
+suites:
+  db:
+    service: client
+    needs: [postgres]
+    command: [psql, -tAc, "SELECT count(*) FROM seeded"]
+`
+
+	makeWorktree := func(name, schema, migrate string) string {
+		dir := filepath.Join(tmp, name)
+		if err := os.CopyFS(dir, os.DirFS(filepath.Join("..", "..", "examples", "minimal"))); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "aviary.yml"), []byte(aviaryYml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "seed.sql"), []byte("CREATE TABLE seeded (id int); INSERT INTO seeded VALUES (1), (2);\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "schema.sql"), []byte(schema), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "migrate.sql"), []byte(migrate), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	runIn := func(dir string, args ...string) (stdout, stderr string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, args...)
+		cmd.Dir = dir
+		cmd.Env = env
+		var outBuf, errBuf bytes.Buffer
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("aviary %s in %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), dir, err, &outBuf, &errBuf)
+		}
+		return outBuf.String(), errBuf.String()
+	}
+
+	wt1 := makeWorktree("snap1", "-- v1\n", "SELECT 1;\n")
+	wt2 := makeWorktree("snap2", "-- v1\n", "SELECT 1;\n")
+	wt3 := makeWorktree("snap3", "-- v2\n", "INSERT INTO seeded VALUES (3);\n")
+
+	for _, dir := range []string{wt1, wt2, wt3} {
+		out, _ := runIn(dir, "env", "--json")
+		var e map[string]string
+		if err := json.Unmarshal([]byte(out), &e); err != nil {
+			t.Fatal(err)
+		}
+		proj := e["AVIARY_PROJECT"]
+		t.Cleanup(func() { _ = compose.DownProject(proj) })
+	}
+
+	// First worktree seeds from scratch and saves the snapshot.
+	out1, err1 := runIn(wt1, "test", "db")
+	if got := lastLine(out1); got != "2" {
+		t.Fatalf("wt1 test db = %q, want 2", got)
+	}
+	if !strings.Contains(err1, "saved snapshot") {
+		t.Errorf("wt1 stderr missing saved snapshot:\n%s", err1)
+	}
+
+	// Second worktree on the same schema restores without running init steps.
+	out2, err2 := runIn(wt2, "test", "db")
+	if got := lastLine(out2); got != "2" {
+		t.Fatalf("wt2 test db = %q, want 2", got)
+	}
+	if !strings.Contains(err2, "restoring snapshot") || strings.Contains(err2, "init: client psql") {
+		t.Errorf("wt2 stderr should restore snapshot without running init:\n%s", err2)
+	}
+
+	// Third worktree on a newer schema restores and runs after_restore.
+	out3, err3 := runIn(wt3, "test", "db")
+	if got := lastLine(out3); got != "3" {
+		t.Fatalf("wt3 test db = %q, want 3", got)
+	}
+	if !strings.Contains(err3, "after_restore") {
+		t.Errorf("wt3 stderr should run after_restore:\n%s", err3)
+	}
+
+	for _, dir := range []string{wt1, wt2, wt3} {
+		runIn(dir, "rm")
+	}
+}
+
 // withoutAviaryVars drops variables that would point the binary at a
 // different definition or registry than the test's.
 func withoutAviaryVars(environ []string) []string {
