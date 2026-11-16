@@ -284,7 +284,7 @@ suites:
     command: [uv, run, pytest]
 ```
 
-`aviary test api`:
+`aviary test api` prints one line first, naming the suite and whether init will run or was skipped. The first init in a worktree can take several minutes. Then it:
 
 1. runs `prepare` on the host in the worktree root (skipped with `prepare: false`);
 2. runs the init steps, each as `docker compose run --rm <service> <command>`,

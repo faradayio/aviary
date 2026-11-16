@@ -354,12 +354,13 @@ func (a *app) testCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "test [suite [-- args...]]",
 		Short: "Run a named test suite, starting what it needs first",
-		Long: `Run a named test suite from aviary.yml. The prepare steps run on the host
-unless the suite sets prepare: false, the init steps run if the suite wants
-them and they have not run yet, the services the suite needs are started and
-waited on, and the suite's command runs in a fresh container (or on the host
-for host: true suites) with any extra args appended. The exit status is the
-suite's own.
+		Long: `Run a named test suite from aviary.yml. It first prints whether init will
+run; the first init in a worktree can take several minutes. The prepare steps
+run on the host unless the suite sets prepare: false, the init steps run if
+the suite wants them and they have not run yet, the services the suite needs
+are started and waited on, and the suite's command runs in a fresh container
+(or on the host for host: true suites) with any extra args appended. The exit
+status is the suite's own.
 
 With no suite, list the suites aviary.yml defines.`,
 		// Arguments after the suite name go to the suite's command, so cobra

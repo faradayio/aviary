@@ -541,6 +541,53 @@ func suiteConfig() *config.Config {
 	return cfg
 }
 
+func TestTestAnnouncesWhetherInitWillRun(t *testing.T) {
+	t.Run("running", func(t *testing.T) {
+		s, _ := newStack(t, suiteConfig())
+		var stderr bytes.Buffer
+		s.stderr = &stderr
+		if err := s.Test("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		const want = "aviary: test web: init running (the first init in a worktree can take several minutes)\n"
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+		}
+	})
+
+	t.Run("already initialized", func(t *testing.T) {
+		s, rec := newStack(t, suiteConfig())
+		if err := s.markInitialized(true); err != nil {
+			t.Fatal(err)
+		}
+		var stderr bytes.Buffer
+		s.stderr = &stderr
+		if err := s.Test("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stderr.String(), "aviary: test web: init skipped\n") || strings.Contains(stderr.String(), "several minutes") {
+			t.Errorf("stderr = %q, want init skipped and no first-init warning", stderr.String())
+		}
+		for _, call := range rec.calls {
+			if slices.Contains(call, "db:reset") {
+				t.Errorf("init ran even though it was already recorded: %q", call)
+			}
+		}
+	})
+
+	t.Run("suite opts out", func(t *testing.T) {
+		s, _ := newStack(t, suiteConfig())
+		var stderr bytes.Buffer
+		s.stderr = &stderr
+		if err := s.Test("acceptance", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stderr.String(), "aviary: test acceptance: init skipped\n") || strings.Contains(stderr.String(), "several minutes") {
+			t.Errorf("stderr = %q, want init skipped and no first-init warning", stderr.String())
+		}
+	})
+}
+
 func TestTestRunsInitThenNeedsThenTheSuite(t *testing.T) {
 	s, rec := newStack(t, suiteConfig())
 

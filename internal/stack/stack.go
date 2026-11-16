@@ -380,6 +380,9 @@ func seconds(d time.Duration) string {
 // (or on the host when suite.Host is true) with extra appended (a leading "--"
 // is dropped). The stack-wide and suite profiles apply to both compose calls.
 // A suite that fails returns its status as a *compose.ExitError.
+//
+// The first thing it prints is whether init will run. A first init can sit
+// for several minutes before any other output.
 func (s *Stack) Test(name string, extra []string) error {
 	suite, ok := s.Config.Suites[name]
 	if !ok {
@@ -389,6 +392,7 @@ func (s *Stack) Test(name string, extra []string) error {
 		}
 		return fmt.Errorf("no suite %q; available: %s", name, strings.Join(names, ", "))
 	}
+	s.announceTest(name, suite)
 	if suite.WantsPrepare() {
 		if err := s.Prepare(); err != nil {
 			return err
@@ -425,6 +429,16 @@ func (s *Stack) Test(name string, extra []string) error {
 	c.Profiles = slices.Concat(c.Profiles, suite.Profiles)
 	c.Env = s.composeEnv(suite.Env)
 	return s.runner(c, slices.Concat([]string{"run", "--rm"}, envFlags, []string{suite.Service}, suite.Command, extra)...)
+}
+
+// announceTest names the suite and says whether init will run, before prepare
+// or init, so a quiet first run is not mistaken for a hang.
+func (s *Stack) announceTest(name string, suite config.Suite) {
+	if suite.WantsInit() && s.Entry.InitializedAt == nil {
+		fmt.Fprintf(s.stderr, "aviary: test %s: init running (the first init in a worktree can take several minutes)\n", name)
+		return
+	}
+	fmt.Fprintf(s.stderr, "aviary: test %s: init skipped\n", name)
 }
 
 // SuiteNames returns the stack's suite names, sorted.
