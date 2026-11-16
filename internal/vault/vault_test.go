@@ -16,6 +16,7 @@ type fakeVault struct {
 	server  *httptest.Server
 	valid   map[string]bool
 	minted  atomic.Int32
+	lookups atomic.Int32
 	mintTTL int
 }
 
@@ -26,6 +27,7 @@ func newFakeVault(t *testing.T, valid map[string]bool) *fakeVault {
 		tok := r.Header.Get("X-Vault-Token")
 		switch r.URL.Path {
 		case "/v1/auth/token/lookup-self":
+			fv.lookups.Add(1)
 			if fv.valid[tok] {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"data":{"ttl":3600}}`))
@@ -41,7 +43,7 @@ func newFakeVault(t *testing.T, valid map[string]bool) *fakeVault {
 			}
 			var req createTokenRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.Renewable || !strings.HasPrefix(req.DisplayName, "aviary-") {
+			if req.Renewable || req.DisplayName != "aviary" {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
@@ -84,7 +86,7 @@ func TestTokenMintsFromHomeTokenAndCachesAcrossCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tok1, err := c.Token("aviary-fdy-abc123")
+	tok1, err := c.Token()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +96,7 @@ func TestTokenMintsFromHomeTokenAndCachesAcrossCalls(t *testing.T) {
 
 	// Still more than half TTL remaining: reuses the cached child token.
 	c.Now = func() time.Time { return now.Add(3 * time.Hour) }
-	tok2, err := c.Token("aviary-fdy-abc123")
+	tok2, err := c.Token()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +106,7 @@ func TestTokenMintsFromHomeTokenAndCachesAcrossCalls(t *testing.T) {
 
 	// Past half TTL: mints a fresh child token.
 	c.Now = func() time.Time { return now.Add(5 * time.Hour) }
-	tok3, err := c.Token("aviary-fdy-abc123")
+	tok3, err := c.Token()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +123,7 @@ func TestStaleEnvVaultTokenFallsBackToHomeToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tok, err := c.Token("aviary-fdy-abc123")
+	tok, err := c.Token()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +137,7 @@ func TestValidEnvVaultTokenWinsWithoutMinting(t *testing.T) {
 	fv := newFakeVault(t, map[string]bool{"ci-provided-token": true})
 	c := testClient(t, fv, time.Now().UTC())
 
-	tok, err := c.Token("aviary-fdy-abc123")
+	tok, err := c.Token()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +151,7 @@ func TestMissingOrExpiredLoginInstructsVaultLogin(t *testing.T) {
 	fv := newFakeVault(t, map[string]bool{})
 	c := testClient(t, fv, time.Now().UTC())
 
-	_, err := c.Token("aviary-fdy-abc123")
+	_, err := c.Token()
 	if err == nil || !strings.Contains(err.Error(), "vault login -method=oidc") {
 		t.Fatalf("missing ~/.vault-token err = %v, want oidc login hint", err)
 	}
@@ -157,8 +159,80 @@ func TestMissingOrExpiredLoginInstructsVaultLogin(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(c.HomeDir, ".vault-token"), []byte("expired-parent"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.Token("aviary-fdy-abc123")
+	_, err = c.Token()
 	if err == nil || !strings.Contains(err.Error(), "vault login -method=oidc") {
 		t.Fatalf("expired ~/.vault-token err = %v, want oidc login hint", err)
+	}
+}
+
+func TestCachedTokenIsUsedWithoutAskingVault(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t, map[string]bool{"parent-token": true})
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	c := testClient(t, fv, now)
+	if err := os.WriteFile(filepath.Join(c.HomeDir, ".vault-token"), []byte("parent-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Token(); err != nil {
+		t.Fatal(err)
+	}
+
+	fv.server.Close()
+	c.Now = func() time.Time { return now.Add(time.Hour) }
+	tok, err := c.Token()
+	if err != nil {
+		t.Fatalf("cached token needed Vault: %v", err)
+	}
+	if tok != "child-token-1" || fv.lookups.Load() != 0 {
+		t.Fatalf("tok = %q, lookups = %d; want cached token and no lookups", tok, fv.lookups.Load())
+	}
+}
+
+func TestShortLeaseWarnsAndIsReusedForHalfItsLife(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t, map[string]bool{"parent-token": true})
+	fv.mintTTL = 3600
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	c := testClient(t, fv, now)
+	var stderr strings.Builder
+	c.Stderr = &stderr
+	if err := os.WriteFile(filepath.Join(c.HomeDir, ".vault-token"), []byte("parent-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.Token(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "granted a 1h0m0s token instead of 8h0m0s") {
+		t.Errorf("stderr = %q, want a warning about the 1h lease", stderr.String())
+	}
+	c.Now = func() time.Time { return now.Add(20 * time.Minute) }
+	if _, err := c.Token(); err != nil {
+		t.Fatal(err)
+	}
+	if fv.minted.Load() != 1 {
+		t.Errorf("minted = %d; want the 1h token reused at 20 minutes", fv.minted.Load())
+	}
+	c.Now = func() time.Time { return now.Add(40 * time.Minute) }
+	if _, err := c.Token(); err != nil {
+		t.Fatal(err)
+	}
+	if fv.minted.Load() != 2 {
+		t.Errorf("minted = %d; want a new token past half the 1h lease", fv.minted.Load())
+	}
+}
+
+func TestEnvTokenWithoutHomeLoginPassesThroughUnchecked(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "ci-provided-token")
+	fv := newFakeVault(t, map[string]bool{})
+	c := testClient(t, fv, time.Now().UTC())
+	fv.server.Close()
+
+	tok, err := c.Token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "ci-provided-token" {
+		t.Fatalf("tok = %q, want the env token as is", tok)
 	}
 }

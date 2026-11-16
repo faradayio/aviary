@@ -1,6 +1,8 @@
-// Package vault mints and caches scoped child Vault tokens from a developer's
-// local Vault login (`~/.vault-token`) or an ambient VAULT_TOKEN, so stacks
-// never need manual token exports in every shell.
+// Package vault mints and caches short-lived child Vault tokens from a
+// developer's local Vault login (`~/.vault-token`) or an ambient VAULT_TOKEN,
+// so stacks never need manual token exports in every shell. A child token
+// carries every policy of its parent; it differs only in expiring sooner and
+// being revoked with the parent.
 package vault
 
 import (
@@ -33,12 +35,28 @@ type Client struct {
 	HomeDir    string
 	HTTPClient *http.Client
 	Now        func() time.Time
+	// Stderr receives a warning when Vault grants a child token a shorter
+	// lease than TTL, usually because the parent login is about to expire.
+	Stderr io.Writer
 }
 
+// cachedToken is a minted child token as saved on disk, shared by every
+// worktree that uses the same Vault server.
 type cachedToken struct {
 	Addr      string    `json:"addr"`
 	Token     string    `json:"token"`
+	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// fresh reports whether less than half of the token's granted lease has
+// passed, so a long test suite does not start with a token about to expire.
+// It trusts the recorded expiry instead of asking Vault, so commands work
+// offline while the token lasts. Measuring against the granted lease, not the
+// requested TTL, keeps a short lease (from a parent login near its end) in
+// use for half its life instead of minting a new token on every command.
+func (t cachedToken) fresh(now time.Time) bool {
+	return now.Before(t.IssuedAt.Add(t.ExpiresAt.Sub(t.IssuedAt) / 2))
 }
 
 type createTokenRequest struct {
@@ -52,9 +70,6 @@ type vaultResponse struct {
 		ClientToken   string `json:"client_token"`
 		LeaseDuration int    `json:"lease_duration"`
 	} `json:"auth"`
-	Data *struct {
-		TTL int `json:"ttl"`
-	} `json:"data"`
 	Errors []string `json:"errors"`
 }
 
@@ -83,6 +98,7 @@ func NewClient(cfg *config.Vault) (*Client, error) {
 		HomeDir:    home,
 		HTTPClient: &http.Client{Timeout: 15 * time.Second},
 		Now:        time.Now,
+		Stderr:     os.Stderr,
 	}, nil
 }
 
@@ -101,28 +117,26 @@ func defaultCacheDir() (string, error) {
 // Token returns a live Vault token for services to read secrets with.
 //
 // Resolution order:
-//  1. A non-empty VAULT_TOKEN in env that Vault accepts on lookup-self (used as
-//     is, for CI or explicit overrides). If VAULT_TOKEN is set in env AND
-//     `~/.vault-token` exists, an expired env token falls through to minting
-//     from `~/.vault-token` because agent shells frequently inherit stale
-//     VAULT_TOKEN exports. If no `~/.vault-token` exists, an invalid env token
-//     fails immediately.
-//  2. A cached child token on disk for this Vault server with more than half
-//     of c.TTL remaining and accepted by lookup-self.
-//  3. A fresh non-renewable child token minted from `~/.vault-token` and saved
+//  1. A non-empty VAULT_TOKEN in env, for CI or explicit overrides. With no
+//     `~/.vault-token` to fall back to, it is used as is without asking
+//     Vault. Otherwise it is used only if Vault accepts it on lookup-self,
+//     because agent shells often inherit stale VAULT_TOKEN exports.
+//  2. A fresh cached child token on disk for this Vault server (see
+//     cachedToken.fresh), used without asking Vault.
+//  3. A new non-renewable child token minted from `~/.vault-token` and saved
 //     to the cache with mode 0600.
-func (c *Client) Token(project string) (string, error) {
+func (c *Client) Token() (string, error) {
 	envToken := strings.TrimSpace(os.Getenv("VAULT_TOKEN"))
 	homeToken := c.readHomeToken()
 
 	if envToken != "" {
+		if homeToken == "" {
+			return envToken, nil
+		}
 		if ok, err := c.validToken(envToken); err != nil {
 			return "", err
 		} else if ok {
 			return envToken, nil
-		}
-		if homeToken == "" {
-			return "", fmt.Errorf("VAULT_TOKEN in the environment is expired or invalid, and %s does not exist; run `VAULT_ADDR=%s vault login -method=oidc`", c.homeTokenPath(), c.Addr)
 		}
 	}
 
@@ -137,18 +151,14 @@ func (c *Client) Token(project string) (string, error) {
 	defer lock.Unlock()
 
 	if cached, ok := c.loadCached(cachePath); ok {
-		if valid, err := c.validToken(cached.Token); err != nil {
-			return "", err
-		} else if valid {
-			return cached.Token, nil
-		}
+		return cached.Token, nil
 	}
 
 	if homeToken == "" {
 		return "", fmt.Errorf("no Vault login found at %s; ask the user to run `VAULT_ADDR=%s vault login -method=oidc`", c.homeTokenPath(), c.Addr)
 	}
 
-	minted, err := c.mintChild(homeToken, project)
+	minted, err := c.mintChild(homeToken)
 	if err != nil {
 		return "", err
 	}
@@ -179,12 +189,7 @@ func (c *Client) loadCached(path string) (cachedToken, bool) {
 	if err := json.Unmarshal(raw, &tok); err != nil {
 		return cachedToken{}, false
 	}
-	if tok.Addr != c.Addr || tok.Token == "" {
-		return cachedToken{}, false
-	}
-	// Refresh once less than half the desired TTL remains so a long test suite
-	// does not start with a token about to expire.
-	if !c.Now().Add(c.TTL / 2).Before(tok.ExpiresAt) {
+	if tok.Addr != c.Addr || tok.Token == "" || !tok.fresh(c.Now()) {
 		return cachedToken{}, false
 	}
 	return tok, true
@@ -251,11 +256,11 @@ func (c *Client) validToken(token string) (bool, error) {
 	return false, fmt.Errorf("Vault lookup-self at %s returned HTTP %d", c.Addr, resp.StatusCode)
 }
 
-func (c *Client) mintChild(parentToken, project string) (cachedToken, error) {
+func (c *Client) mintChild(parentToken string) (cachedToken, error) {
 	body, err := json.Marshal(createTokenRequest{
 		TTL:         fmt.Sprintf("%ds", int(c.TTL.Seconds())),
 		Renewable:   false,
-		DisplayName: "aviary-" + project,
+		DisplayName: "aviary",
 	})
 	if err != nil {
 		return cachedToken{}, err
@@ -294,9 +299,16 @@ func (c *Client) mintChild(parentToken, project string) (cachedToken, error) {
 	if parsed.Auth.LeaseDuration > 0 {
 		lease = time.Duration(parsed.Auth.LeaseDuration) * time.Second
 	}
+	// Vault also caps leases at a role's max TTL, so a short lease does not
+	// prove the login is ending.
+	if lease < c.TTL && c.Stderr != nil {
+		fmt.Fprintf(c.Stderr, "aviary: Vault granted a %s token instead of %s; if your Vault login at %s is about to expire, run `VAULT_ADDR=%s vault login -method=oidc`\n", lease.Round(time.Second), c.TTL, c.homeTokenPath(), c.Addr)
+	}
+	issuedAt := c.Now().UTC()
 	return cachedToken{
 		Addr:      c.Addr,
 		Token:     parsed.Auth.ClientToken,
-		ExpiresAt: c.Now().UTC().Add(lease),
+		IssuedAt:  issuedAt,
+		ExpiresAt: issuedAt.Add(lease),
 	}, nil
 }

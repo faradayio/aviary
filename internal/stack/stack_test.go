@@ -751,7 +751,7 @@ host_env:
 
 	s, err := Load(root, "", Options{
 		Registry: testRegistry(t),
-		VaultToken: func(cfg *config.Vault, project string) (string, error) {
+		VaultToken: func(cfg *config.Vault) (string, error) {
 			return "secret-child-token", nil
 		},
 	})
@@ -764,6 +764,73 @@ host_env:
 	c := s.Compose()
 	if c.Env["VAULT_TOKEN"] != "secret-child-token" || c.Env["VAULT_ADDR"] != "https://vault2.faraday.ai" || c.Env["ADC_PATH"] != adc {
 		t.Errorf("Compose().Env = %v", c.Env)
+	}
+}
+
+func TestSuiteThatWantsPrepareAndInitPreparesOnce(t *testing.T) {
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Prepare: []config.HostStep{{Command: []string{"make", "artifacts"}}},
+		Init:    []config.Step{{Service: "migrate", Command: []string{"rake", "db:reset"}}},
+		Suites: map[string]config.Suite{
+			"api": {Service: "api", Command: []string{"npm", "test"}},
+		},
+	}
+	s, rec := newStack(t, cfg)
+	var prepares int
+	s.hostRunner = func(dir string, extraEnv map[string]string, command []string) error {
+		prepares++
+		return nil
+	}
+
+	if err := s.Test("api", nil); err != nil {
+		t.Fatal(err)
+	}
+	if prepares != 1 {
+		t.Errorf("prepare ran %d times, want 1", prepares)
+	}
+	assertCalls(t, rec,
+		argv(nil, "run", "--rm", "migrate", "rake", "db:reset"),
+		argv(nil, "run", "--rm", "api", "npm", "test"),
+	)
+}
+
+func TestContainerSuiteEnvTravelsInComposeEnvironmentNotArgv(t *testing.T) {
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Ports:   []string{"postgres"},
+		Suites: map[string]config.Suite{
+			"api": {
+				Service: "api",
+				Init:    new(bool),
+				Prepare: new(bool),
+				Env: map[string]string{
+					"DATABASE_URL": "postgresql://postgres@postgres:${AVIARY_PORT_POSTGRES}/db",
+					"PRICE":        "$$5",
+				},
+				Command: []string{"npm", "test"},
+			},
+		},
+	}
+	s, _ := newStack(t, cfg)
+	var gotArgs []string
+	var gotEnv map[string]string
+	s.runner = func(c compose.Stack, args ...string) error {
+		gotArgs, gotEnv = args, c.Env
+		return nil
+	}
+
+	if err := s.Test("api", nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"run", "--rm", "--env", "DATABASE_URL", "--env", "PRICE", "api", "npm", "test"}; !slices.Equal(gotArgs, want) {
+		t.Errorf("args = %q, want %q", gotArgs, want)
+	}
+	if want := "postgresql://postgres@postgres:" + strconv.Itoa(s.Entry.Ports["postgres"]) + "/db"; gotEnv["DATABASE_URL"] != want {
+		t.Errorf("DATABASE_URL = %q, want %q", gotEnv["DATABASE_URL"], want)
+	}
+	if gotEnv["PRICE"] != "$5" {
+		t.Errorf("PRICE = %q, want $5", gotEnv["PRICE"])
 	}
 }
 

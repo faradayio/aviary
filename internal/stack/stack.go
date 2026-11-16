@@ -39,6 +39,8 @@ type Stack struct {
 	runner func(c compose.Stack, args ...string) error
 	// hostRunner is Options.HostRunner.
 	hostRunner func(dir string, extraEnv map[string]string, command []string) error
+	// prepared is set once this Stack has run the prepare steps.
+	prepared bool
 	// stderr receives aviary's progress lines for init steps.
 	stderr io.Writer
 }
@@ -65,7 +67,7 @@ type Options struct {
 	HostRunner func(dir string, extraEnv map[string]string, command []string) error
 	// VaultToken overrides Vault token minting during tests. When nil and
 	// cfg.Vault is set, vault.NewClient(cfg.Vault).Token is called.
-	VaultToken func(cfg *config.Vault, project string) (string, error)
+	VaultToken func(cfg *config.Vault) (string, error)
 }
 
 // Load builds the stack for the worktree containing cwd, allocating any host
@@ -90,7 +92,7 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 			if mint == nil {
 				mint = defaultVaultToken
 			}
-			token, err := mint(cfg.Vault, ws.Project())
+			token, err := mint(cfg.Vault)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", defFile, err)
 			}
@@ -140,12 +142,12 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 	}, nil
 }
 
-func defaultVaultToken(cfg *config.Vault, project string) (string, error) {
+func defaultVaultToken(cfg *config.Vault) (string, error) {
 	client, err := vault.NewClient(cfg)
 	if err != nil {
 		return "", err
 	}
-	return client.Token(project)
+	return client.Token()
 }
 
 func resolveHostEnv(specs map[string]config.HostFile, out map[string]string) error {
@@ -222,12 +224,19 @@ func (s *Stack) Env() map[string]string {
 	return env
 }
 
+// composeEnv is Env plus the resolved credentials, plus extra with each value
+// interpolated against those (not against other extra values) and then the
+// host environment. `$$` is a literal `$`, as in compose files.
 func (s *Stack) composeEnv(extra map[string]string) map[string]string {
-	env := s.Env()
-	maps.Copy(env, s.resolvedEnv)
+	base := s.Env()
+	maps.Copy(base, s.resolvedEnv)
+	env := maps.Clone(base)
 	for k, v := range extra {
 		env[k] = os.Expand(v, func(name string) string {
-			if val, ok := env[name]; ok {
+			if name == "$" {
+				return "$"
+			}
+			if val, ok := base[name]; ok {
 				return val
 			}
 			return os.Getenv(name)
@@ -281,14 +290,31 @@ func (s *Stack) run(extraProfiles []string, args ...string) error {
 	return s.runner(c, args...)
 }
 
-// Prepare runs the host prepare steps from aviary.yml in the worktree root.
+// Prepare runs the host prepare steps from aviary.yml in the worktree root,
+// under the stack's lock so two aviary commands in one worktree never run
+// them at once.
 func (s *Stack) Prepare() error {
+	unlock, err := s.registry.LockProject(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.prepareLocked()
+}
+
+// prepareLocked runs the prepare steps at most once per Stack, so a command
+// that prepares and then inits runs them once. The caller holds the lock.
+func (s *Stack) prepareLocked() error {
+	if s.prepared {
+		return nil
+	}
 	for i, step := range s.Config.Prepare {
 		desc := strings.Join(step.Command, " ")
 		if err := s.hostRunner(s.Workspace.Root, s.composeEnv(nil), step.Command); err != nil {
 			return fmt.Errorf("prepare step %d (%s) failed: %v", i+1, desc, err)
 		}
 	}
+	s.prepared = true
 	return nil
 }
 
@@ -312,7 +338,7 @@ func (s *Stack) Init(force bool) error {
 	if s.Entry.InitializedAt != nil && !force {
 		return nil
 	}
-	if err := s.Prepare(); err != nil {
+	if err := s.prepareLocked(); err != nil {
 		return err
 	}
 	if err := s.runSteps("init", s.Config.Init); err != nil {
@@ -389,13 +415,16 @@ func (s *Stack) Test(name string, extra []string) error {
 		}
 		return s.hostRunner(dir, s.composeEnv(suite.Env), slices.Concat(suite.Command, extra))
 	}
+	// `--env KEY` with no value makes compose read the value from its own
+	// environment, so values never appear in the process list.
 	envFlags := make([]string, 0, len(suite.Env)*2)
-	resolvedSuiteEnv := s.composeEnv(suite.Env)
 	for _, k := range slices.Sorted(maps.Keys(suite.Env)) {
-		envFlags = append(envFlags, "--env", k+"="+resolvedSuiteEnv[k])
+		envFlags = append(envFlags, "--env", k)
 	}
-	args := slices.Concat([]string{"run", "--rm"}, envFlags, []string{suite.Service}, suite.Command, extra)
-	return s.run(suite.Profiles, args...)
+	c := s.Compose()
+	c.Profiles = slices.Concat(c.Profiles, suite.Profiles)
+	c.Env = s.composeEnv(suite.Env)
+	return s.runner(c, slices.Concat([]string{"run", "--rm"}, envFlags, []string{suite.Service}, suite.Command, extra)...)
 }
 
 // SuiteNames returns the stack's suite names, sorted.

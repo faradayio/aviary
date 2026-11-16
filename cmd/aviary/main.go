@@ -53,7 +53,7 @@ type app struct {
 	downProject  func(name string) error
 	runCompose   func(c compose.Stack, args ...string) error
 	runHost      func(dir string, extraEnv map[string]string, command []string) error
-	vaultToken   func(cfg *config.Vault, project string) (string, error)
+	vaultToken   func(cfg *config.Vault) (string, error)
 	branch       func(root string) string
 }
 
@@ -201,7 +201,21 @@ helper works unattended without an interactive gcloud reauthentication prompt.`,
 	}
 }
 
+// gcloudADCToken prints an access token from gcloud's Application Default
+// Credentials, or returns empty when there are none, without starting gcloud
+// on machines that never ran `gcloud auth application-default login`.
 func gcloudADCToken() string {
+	configDir := os.Getenv("CLOUDSDK_CONFIG")
+	if configDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		configDir = filepath.Join(home, ".config", "gcloud")
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "application_default_credentials.json")); err != nil {
+		return ""
+	}
 	out, err := exec.Command("gcloud", "auth", "application-default", "print-access-token").Output()
 	if err != nil {
 		return ""
@@ -340,10 +354,12 @@ func (a *app) testCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "test [suite [-- args...]]",
 		Short: "Run a named test suite, starting what it needs first",
-		Long: `Run a named test suite from aviary.yml. The stack's init steps run first if
-the suite wants them and they have not run yet, the services the suite needs
-are started and waited on, and the suite's command runs in a fresh container
-with any extra args appended. The exit status is the suite's own.
+		Long: `Run a named test suite from aviary.yml. The prepare steps run on the host
+unless the suite sets prepare: false, the init steps run if the suite wants
+them and they have not run yet, the services the suite needs are started and
+waited on, and the suite's command runs in a fresh container (or on the host
+for host: true suites) with any extra args appended. The exit status is the
+suite's own.
 
 With no suite, list the suites aviary.yml defines.`,
 		// Arguments after the suite name go to the suite's command, so cobra

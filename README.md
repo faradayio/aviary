@@ -41,7 +41,7 @@ the first or has to be started by hand with different settings.
 | One stack per machine, fixed host ports             | One stack per worktree, a port set per worktree                                 |
 | Writes into the checkout (`pods/`, mounted sources) | Writes nothing into the worktree; sources are bind-mounted by your compose file |
 | Pods, targets and overlays                          | Compose profiles and extra compose files                                        |
-| Mints a Vault token per service                     | Checks that the variables in `require_env` are set and passes them through      |
+| Mints a Vault token per service                     | Mints one Vault token shared by every stack, and checks `require_env`           |
 | Build and deploy path for production                | Local development and testing only                                              |
 
 cage remains the deploy tool. aviary replaces it only for running a repository
@@ -186,12 +186,18 @@ Commands that create containers (`up`, `test`, `init`, `run`, `build`, and
 `aviary compose up` or `run`) resolve credentials in this order before calling
 compose:
 
-1. **`vault`**: if `VAULT_TOKEN` is set in the environment and accepted by
-   `lookup-self`, aviary uses it as-is. Otherwise it mints a non-renewable
-   child token from `~/.vault-token`, caches it under
+1. **`vault`**: a `VAULT_TOKEN` already in the environment wins. When
+   `~/.vault-token` also exists, aviary first checks the variable with
+   `lookup-self` and falls back to `~/.vault-token` if Vault rejects it, since
+   agent shells often inherit stale exports. Otherwise aviary mints a
+   non-renewable child token from `~/.vault-token`, caches it under
    `$XDG_STATE_HOME/aviary/vault-token.json` (`0600`), and reuses it across
-   worktrees and shells until less than half of `ttl` remains. An expired
-   `VAULT_TOKEN` in an agent shell falls back to `~/.vault-token` automatically.
+   worktrees and shells until half of its lease has passed. aviary trusts the
+   cached token's recorded expiry without asking Vault, so commands work
+   offline while it lasts; after `vault token revoke`, delete the cache file.
+   The child token has every policy your login has, and Vault caps its lease
+   at your login's remaining time, so aviary warns when Vault grants less
+   than `ttl`. `VAULT_ADDR` is set to `vault.addr`, overriding the shell's.
    `VAULT_TOKEN` is passed to compose subprocesses and never printed by
    `aviary env`.
 2. **`host_env`**: each unset variable is filled with the expanded `path` when
@@ -210,7 +216,9 @@ prepare:
 Commands that run code from the worktree (`up`, `init`, `run`, and any suite
 without `prepare: false`) run `prepare` on the host in the worktree root first,
 so gitignored build/codegen inputs exist in fresh worktrees without an extra
-step.
+step. The steps run at most once per command and never in two aviary commands
+in one worktree at once. Init runs them even for a suite with
+`prepare: false`, because init steps may need their output.
 
 ### Definitions outside the worktree
 
@@ -283,8 +291,12 @@ suites:
    if init has not run for this stack yet (skipped with `init: false`);
 3. starts `postgres` and `redis` and waits until they are healthy;
 4. runs `npm test` in a fresh `api` container (or directly on the host in
-   `workdir` when `host: true`, with `env` interpolated against the stack's
-   `AVIARY_*` variables).
+   `workdir` when `host: true`).
+
+A suite's `env` is interpolated against the stack's `AVIARY_*` variables and
+resolved credentials, then the host environment; `$$` is a literal `$`. For
+container suites the values reach compose through its environment, not its
+command line, so they never show up in `ps`.
 
 Arguments after the suite name, with or without a `--`, are appended to its
 command, so `aviary test api -- --grep users` and `aviary test api --help`
@@ -509,7 +521,7 @@ and those of similar compose wrappers, map like this:
 | `exec`, `shell`                | `aviary exec <service> <command...>`                                                              |
 | `test`                         | `aviary test <suite>`, with the suites named in `aviary.yml`                                      |
 | `logs`, `build`                | `aviary logs`, `aviary build`                                                                     |
-| `pull`                         | `aviary compose pull`                                                                             |
+| `pull`                         | `aviary pull [service...]`                                                                        |
 | init, seed                     | `aviary init`; `aviary down --volumes` first to start from empty volumes                          |
 | source mount, unmount          | none: the compose files bind-mount the worktree's sources, so each stack always runs its own code |
 | targets, environments          | more files under `compose.files`, or [profiles](#profiles)                                        |
