@@ -76,10 +76,30 @@ func (s Stack) Args(sub ...string) []string {
 	return append(argv, sub...)
 }
 
+// isTerminal reports whether f is a character device (TTY).
+func isTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 // environ is the inherited environment followed by Env in key order. exec
-// keeps the last value of a repeated key, so Env wins over the host.
+// keeps the last value of a repeated key, so Env wins over the host. When
+// stderr is not a terminal (coding agents, CI, redirected logs) and the caller
+// has not set COMPOSE_PROGRESS, it defaults to "quiet" so compose's container
+// wait spinners do not bury test output.
 func (s Stack) environ() []string {
 	env := os.Environ()
+	if os.Getenv("COMPOSE_PROGRESS") == "" && !isTerminal(os.Stderr) {
+		if _, ok := s.Env["COMPOSE_PROGRESS"]; !ok {
+			env = append(env, "COMPOSE_PROGRESS=quiet")
+		}
+	}
 	for _, k := range slices.Sorted(maps.Keys(s.Env)) {
 		env = append(env, k+"="+s.Env[k])
 	}
@@ -149,6 +169,23 @@ func runSignals(cmd *exec.Cmd) error {
 		}
 	}()
 	return cmd.Wait()
+}
+
+// RunHost executes a command directly on the host in dir with extraEnv merged
+// over the inherited environment, forwarding signals and returning non-zero
+// statuses as *ExitError.
+func RunHost(dir string, extraEnv map[string]string, command []string) error {
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Dir = dir
+	env := os.Environ()
+	for _, k := range slices.Sorted(maps.Keys(extraEnv)) {
+		env = append(env, k+"="+extraEnv[k])
+	}
+	cmd.Env = env
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return exitError(runSignals(cmd))
 }
 
 // exitError turns a non-zero exit into *ExitError. A process killed by a

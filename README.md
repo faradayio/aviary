@@ -166,16 +166,51 @@ path, so a worktree at the same path gets the same ports on every machine.
 aviary skips ports another stack holds or something on the machine is
 listening on. A worktree keeps its ports until `aviary rm` or `aviary gc`.
 
-### Required environment
+### Required environment, Vault tokens, and host files
 
 ```yaml
+vault:
+  addr: https://vault.example.com
+  ttl: 8h
+
+host_env:
+  GOOGLE_CREDENTIALS_HOST_PATH:
+    path: ~/.config/gcloud/application_default_credentials.json
+    required: true
+    hint: ask the user to run `gcloud auth application-default login`
+
 require_env: [VAULT_TOKEN]
 ```
 
 Commands that create containers (`up`, `test`, `init`, `run`, `build`, and
-`aviary compose up` or `run`) refuse to start while any of these is unset or
-empty, and name every missing one. The host environment passes through to
-compose, so compose files can interpolate them.
+`aviary compose up` or `run`) resolve credentials in this order before calling
+compose:
+
+1. **`vault`**: if `VAULT_TOKEN` is set in the environment and accepted by
+   `lookup-self`, aviary uses it as-is. Otherwise it mints a non-renewable
+   child token from `~/.vault-token`, caches it under
+   `$XDG_STATE_HOME/aviary/vault-token.json` (`0600`), and reuses it across
+   worktrees and shells until less than half of `ttl` remains. An expired
+   `VAULT_TOKEN` in an agent shell falls back to `~/.vault-token` automatically.
+   `VAULT_TOKEN` is passed to compose subprocesses and never printed by
+   `aviary env`.
+2. **`host_env`**: each unset variable is filled with the expanded `path` when
+   that file exists on the host. When `required: true` and the file is missing,
+   aviary stops before touching Docker and prints `hint`.
+3. **`require_env`**: refuses to start while any listed variable is still unset
+   or empty, naming every missing one.
+
+### Prepare steps
+
+```yaml
+prepare:
+  - command: [node, scripts/copy-api-artifacts.mts, --all]
+```
+
+Commands that run code from the worktree (`up`, `init`, `run`, and any suite
+without `prepare: false`) run `prepare` on the host in the worktree root first,
+so gitignored build/codegen inputs exist in fresh worktrees without an extra
+step.
 
 ### Definitions outside the worktree
 
@@ -231,14 +266,25 @@ suites:
     needs: [postgres]
     command: [npm, run, test:migrations]
     init: false
+  worker-host:
+    host: true
+    workdir: src/worker
+    init: false
+    needs: [postgres]
+    env:
+      TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${AVIARY_PORT_POSTGRES}/postgres
+    command: [uv, run, pytest]
 ```
 
 `aviary test api`:
 
-1. runs the init steps, each as `docker compose run --rm <service> <command>`,
+1. runs `prepare` on the host in the worktree root (skipped with `prepare: false`);
+2. runs the init steps, each as `docker compose run --rm <service> <command>`,
    if init has not run for this stack yet (skipped with `init: false`);
-2. starts `postgres` and `redis` and waits until they are healthy;
-3. runs `npm test` in a fresh `api` container.
+3. starts `postgres` and `redis` and waits until they are healthy;
+4. runs `npm test` in a fresh `api` container (or directly on the host in
+   `workdir` when `host: true`, with `env` interpolated against the stack's
+   `AVIARY_*` variables).
 
 Arguments after the suite name, with or without a `--`, are appended to its
 command, so `aviary test api -- --grep users` and `aviary test api --help`
@@ -289,6 +335,9 @@ Run from anywhere inside a worktree. `aviary <command> --help` describes each.
 - `aviary down` stops it and keeps its volumes; `--volumes` removes them too.
 - `aviary test <suite> [args...]` runs a suite; with no suite it lists them.
 - `aviary init [--force]` runs the init steps by hand.
+- `aviary pull [service...]` pulls the stack's images across every profile
+  (using `gcloud` Application Default Credentials automatically when present so
+  GCR pulls never hang on an interactive reauth prompt).
 - `aviary run <service> [command...]` runs a one-off command in a fresh
   container and exits with its status.
 - `aviary exec <service> <command...>` runs a command in a running container.

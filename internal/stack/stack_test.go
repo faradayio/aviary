@@ -728,3 +728,90 @@ func TestRemoveVolumesWaitsForARunningInit(t *testing.T) {
 		t.Error("volumes removed after init finished, but the stack is still marked initialized")
 	}
 }
+
+func TestVaultAndHostEnvPassToComposeWithoutLeakingToEnvOutput(t *testing.T) {
+	root := tempDir(t)
+	adc := filepath.Join(root, "adc.json")
+	if err := os.WriteFile(adc, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeDefinition(t, root, `compose:
+  files: [compose.yaml]
+ports: [postgres]
+require_env: [VAULT_TOKEN, ADC_PATH]
+vault:
+  addr: https://vault2.faraday.ai
+host_env:
+  ADC_PATH:
+    path: `+adc+`
+    required: true
+`)
+	unset(t, "VAULT_TOKEN")
+	unset(t, "ADC_PATH")
+
+	s, err := Load(root, "", Options{
+		Registry: testRegistry(t),
+		VaultToken: func(cfg *config.Vault, project string) (string, error) {
+			return "secret-child-token", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := s.Env()["VAULT_TOKEN"]; leaked {
+		t.Error("s.Env() leaked VAULT_TOKEN")
+	}
+	c := s.Compose()
+	if c.Env["VAULT_TOKEN"] != "secret-child-token" || c.Env["VAULT_ADDR"] != "https://vault2.faraday.ai" || c.Env["ADC_PATH"] != adc {
+		t.Errorf("Compose().Env = %v", c.Env)
+	}
+}
+
+func TestPrepareAndHostSuiteExpandPortVariables(t *testing.T) {
+	noInit := false
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Ports:   []string{"postgres"},
+		Prepare: []config.HostStep{{Command: []string{"node", "scripts/copy-api-artifacts.mts", "--all"}}},
+		Suites: map[string]config.Suite{
+			"investigator": {
+				Host:    true,
+				Workdir: "src/investigator",
+				Needs:   []string{"postgres"},
+				Init:    &noInit,
+				Env: map[string]string{
+					"INVESTIGATOR_TEST_DATABASE_URL": "postgresql://postgres@127.0.0.1:${AVIARY_PORT_POSTGRES}/postgres",
+				},
+				Command: []string{"uv", "run", "pytest"},
+			},
+		},
+	}
+	s, rec := newStack(t, cfg)
+	type hostCall struct {
+		dir string
+		env map[string]string
+		cmd []string
+	}
+	var hostCalls []hostCall
+	s.hostRunner = func(dir string, extraEnv map[string]string, command []string) error {
+		hostCalls = append(hostCalls, hostCall{dir, maps.Clone(extraEnv), slices.Clone(command)})
+		return nil
+	}
+
+	if err := s.Test("investigator", []string{"--", "-k", "runs"}); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, rec, argv(nil, "up", "--detach", "--wait", "postgres"))
+	if len(hostCalls) != 2 {
+		t.Fatalf("hostCalls = %+v, want prepare + suite", hostCalls)
+	}
+	if hostCalls[0].dir != "/work/wt" || !slices.Equal(hostCalls[0].cmd, []string{"node", "scripts/copy-api-artifacts.mts", "--all"}) {
+		t.Errorf("prepare call = %+v", hostCalls[0])
+	}
+	wantPort := strconv.Itoa(s.Entry.Ports["postgres"])
+	if hostCalls[1].dir != "/work/wt/src/investigator" ||
+		hostCalls[1].env["INVESTIGATOR_TEST_DATABASE_URL"] != "postgresql://postgres@127.0.0.1:"+wantPort+"/postgres" ||
+		!slices.Equal(hostCalls[1].cmd, []string{"uv", "run", "pytest", "-k", "runs"}) {
+		t.Errorf("suite call = %+v", hostCalls[1])
+	}
+}

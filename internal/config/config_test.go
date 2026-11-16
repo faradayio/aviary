@@ -90,6 +90,49 @@ func TestLoadReadsTheFullSchema(t *testing.T) {
 	}
 }
 
+func TestLoadReadsVaultHostEnvPrepareAndHostSuites(t *testing.T) {
+	cfg, err := Load(write(t, `compose:
+  files: [compose.yaml]
+vault:
+  addr: https://vault2.faraday.ai
+  ttl: 8h
+host_env:
+  FDY_GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH:
+    path: ~/.config/gcloud/application_default_credentials.json
+    required: true
+    hint: run gcloud auth application-default login
+prepare:
+  - command: [node, scripts/copy-api-artifacts.mts, --all]
+suites:
+  investigator:
+    host: true
+    workdir: src/investigator
+    init: false
+    prepare: false
+    needs: [postgres]
+    env:
+      INVESTIGATOR_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${AVIARY_PORT_POSTGRES}/postgres
+    command: [uv, run, pytest]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Vault == nil || cfg.Vault.Addr != "https://vault2.faraday.ai" || cfg.Vault.TTL != "8h" {
+		t.Errorf("vault = %+v", cfg.Vault)
+	}
+	hf := cfg.HostEnv["FDY_GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH"]
+	if !hf.Required || hf.Hint != "run gcloud auth application-default login" {
+		t.Errorf("host_env = %+v", hf)
+	}
+	if len(cfg.Prepare) != 1 || !reflect.DeepEqual(cfg.Prepare[0].Command, []string{"node", "scripts/copy-api-artifacts.mts", "--all"}) {
+		t.Errorf("prepare = %+v", cfg.Prepare)
+	}
+	inv := cfg.Suites["investigator"]
+	if !inv.Host || inv.Workdir != "src/investigator" || inv.WantsInit() || inv.WantsPrepare() {
+		t.Errorf("investigator suite = %+v", inv)
+	}
+}
+
 func TestFullSchemaRoundTrips(t *testing.T) {
 	cfg, err := Load(write(t, fullExample))
 	if err != nil {
@@ -202,6 +245,14 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"require_env starting with a digit":  {base + "require_env: [1TOKEN]\n", `require_env name "1TOKEN"`},
 		"require_env empty name":             {base + "require_env: [\"\"]\n", `require_env name ""`},
 		"require_env with an equals sign":    {base + "require_env: [A=B]\n", `require_env name "A=B"`},
+		"vault without addr":                 {base + "vault: {ttl: 8h}\n", "vault: needs addr"},
+		"vault with bad addr":                {base + "vault: {addr: vault2.faraday.ai}\n", "must be an http or https URL"},
+		"vault with negative ttl":            {base + "vault: {addr: https://vault.test, ttl: -1h}\n", "positive Go duration"},
+		"host_env without path":              {base + "host_env:\n  FOO: {required: true}\n", `host_env["FOO"]: needs path`},
+		"prepare without command":            {base + "prepare:\n  - {}\n", "prepare[0]: needs a command"},
+		"host suite with service":            {base + "suites:\n  s: {host: true, service: api, command: [t]}\n", "host suite must not set service"},
+		"container suite with workdir":       {base + "suites:\n  s: {service: api, workdir: src/x, command: [t]}\n", "workdir is only for host suites"},
+		"host suite with abs workdir":        {base + "suites:\n  s: {host: true, workdir: /abs, command: [t]}\n", "must be relative"},
 	}
 	for name, c := range cases {
 		_, err := Load(write(t, c.body))
