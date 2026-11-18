@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -51,10 +53,15 @@ type app struct {
 	openRegistry func() (*registry.Registry, error)
 	listProjects func() ([]compose.Project, error)
 	downProject  func(name string) error
+	stopProject  func(name string) error
 	runCompose   func(c compose.Stack, args ...string) error
 	runHost      func(dir string, extraEnv map[string]string, command []string) error
+	spawnReaper  func(project string)
 	vaultToken   func(cfg *config.Vault) (string, error)
 	branch       func(root string) string
+	now          func() time.Time
+	sleep        func(time.Duration)
+	maxSleep     time.Duration
 }
 
 func newApp() *app {
@@ -62,10 +69,51 @@ func newApp() *app {
 		openRegistry: registry.Open,
 		listProjects: compose.ListProjects,
 		downProject:  compose.DownProject,
+		stopProject:  compose.StopProject,
 		runCompose:   compose.Stack.Run,
 		runHost:      compose.RunHost,
+		spawnReaper:  spawnDetachedReaper,
 		branch:       workspace.Branch,
+		now:          time.Now,
+		sleep:        time.Sleep,
+		// Poll in short slices so down, rm, up, or a deleted state dir lets
+		// the reaper exit within seconds instead of sleeping the full TTL.
+		maxSleep: 5 * time.Second,
 	}
+}
+
+func (a *app) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}
+
+func (a *app) sleepFor(d time.Duration) {
+	if a.maxSleep > 0 && d > a.maxSleep {
+		d = a.maxSleep
+	}
+	if a.sleep != nil {
+		a.sleep(d)
+		return
+	}
+	time.Sleep(d)
+}
+
+func spawnDetachedReaper(project string) {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aviary: idle reaper: %v\n", err)
+		return
+	}
+	cmd := exec.Command(exe, "__reap-idle", project)
+	cmd.Dir = "/"
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "aviary: idle reaper: %v\n", err)
+		return
+	}
+	_ = cmd.Process.Release()
 }
 
 func (a *app) rootCmd() *cobra.Command {
@@ -106,6 +154,7 @@ func (a *app) rootCmd() *cobra.Command {
 		a.lsCmd(),
 		a.gcCmd(),
 		a.rmCmd(),
+		a.reapIdleCmd(),
 	)
 	return root
 }
@@ -139,8 +188,12 @@ func (a *app) loadStack(opts stack.Options) (*stack.Stack, error) {
 	if opts.Registry, err = a.openRegistry(); err != nil {
 		return nil, err
 	}
+	if a.now != nil {
+		opts.Registry.Now = a.now
+	}
 	opts.Runner = a.runCompose
 	opts.HostRunner = a.runHost
+	opts.SpawnReaper = a.spawnReaper
 	opts.VaultToken = a.vaultToken
 	return stack.Load(cwd, a.configDir(), opts)
 }
@@ -152,11 +205,7 @@ func (a *app) upCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		s.WarnDockerDesktop()
-		if err := s.Prepare(); err != nil {
-			return err
-		}
-		return a.runCompose(s.Compose(), append([]string{"up", "--detach", "--wait"}, args...)...)
+		return s.Up(args)
 	}
 	return cmd
 }
@@ -231,11 +280,7 @@ func (a *app) runCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		s.WarnDockerDesktop()
-		if err := s.Prepare(); err != nil {
-			return err
-		}
-		return a.runCompose(s.Compose(), append([]string{"run", "--rm"}, args...)...)
+		return s.RunOneOff(args)
 	}
 	return cmd
 }
@@ -282,14 +327,40 @@ func (a *app) composeCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if !opts.SkipRequireEnv {
-			s.WarnDockerDesktop()
-		}
 		run := func() error { return a.runCompose(s.Compose(), args...) }
-		if sub == "down" && removesVolumes(rest) {
-			return s.RemoveVolumes(run)
+		if isDryRunOrHelp(args) {
+			return run()
 		}
-		return run()
+		switch sub {
+		case "up":
+			return s.ComposeHold(args)
+		case "run":
+			return s.ComposeUse(args)
+		case "down":
+			if !targetsWholeStack(rest) {
+				return run()
+			}
+			if removesVolumes(rest) {
+				return s.RemoveVolumes(run)
+			}
+			if err := run(); err != nil {
+				return err
+			}
+			return s.MarkStopped()
+		case "stop":
+			if err := run(); err != nil {
+				return err
+			}
+			if targetsWholeStack(rest) {
+				return s.MarkStopped()
+			}
+			return nil
+		default:
+			if !opts.SkipRequireEnv {
+				s.WarnDockerDesktop()
+			}
+			return run()
+		}
 	}
 	return cmd
 }
@@ -328,16 +399,68 @@ func composeSubcommand(args []string) (sub string, rest []string) {
 }
 
 // removesVolumes reports whether down's arguments ask it to remove volumes.
+// Compose accepts -v and --volumes with an optional bool (=true, =false), and
+// the last one wins. Arguments after -- are service names.
 func removesVolumes(args []string) bool {
+	remove := false
+	for _, arg := range args {
+		if arg == "--" {
+			return remove
+		}
+		name, value, hasValue := strings.Cut(arg, "=")
+		if name != "-v" && name != "--volumes" {
+			continue
+		}
+		if !hasValue {
+			remove = true
+			continue
+		}
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			continue
+		}
+		remove = parsed
+	}
+	return remove
+}
+
+func isDryRunOrHelp(args []string) bool {
 	for _, arg := range args {
 		if arg == "--" {
 			return false
 		}
-		if arg == "-v" || arg == "--volumes" || arg == "--volumes=true" {
+		if arg == "--dry-run" || arg == "--dry-run=true" || arg == "--help" || arg == "-h" {
 			return true
 		}
 	}
 	return false
+}
+
+// commandValueFlags are flags whose following argument is a value, not a
+// service name. `--rmi local` is the whole stack; `down postgres` is not.
+var commandValueFlags = map[string]bool{
+	"-t": true, "--timeout": true,
+	"--rmi": true,
+}
+
+// targetsWholeStack reports whether args name no service, so the command
+// applies to every container in the stack.
+func targetsWholeStack(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return len(args[i+1:]) == 0
+		}
+		name, _, hasValue := strings.Cut(arg, "=")
+		if strings.HasPrefix(name, "-") {
+			if !hasValue && commandValueFlags[name] {
+				i++
+			}
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (a *app) downCmd() *cobra.Command {
@@ -465,9 +588,11 @@ type stackRow struct {
 	Branch          string `json:"branch"`
 	WorktreeMissing bool   `json:"worktree_missing"`
 	Initialized     bool   `json:"initialized"`
-	// CreatedAt and InitializedAt are null when the registry has no time.
+	Held            bool   `json:"held"`
+	// CreatedAt, InitializedAt and LastUsedAt are null when unset.
 	CreatedAt     *time.Time     `json:"created_at"`
 	InitializedAt *time.Time     `json:"initialized_at"`
+	LastUsedAt    *time.Time     `json:"last_used_at"`
 	Ports         map[string]int `json:"ports"`
 	// Config is "in-tree" or the external definition directory.
 	Config string `json:"config"`
@@ -520,7 +645,9 @@ func (a *app) rows(entries []registry.Entry, projects []compose.Project) []stack
 			Status:        status[e.Project],
 			Root:          e.Root,
 			Initialized:   e.InitializedAt != nil,
+			Held:          e.Held,
 			InitializedAt: e.InitializedAt,
+			LastUsedAt:    e.LastUsedAt,
 			Ports:         e.Ports,
 			Config:        e.Config,
 		}
@@ -564,7 +691,7 @@ func (a *app) gcCmd() *cobra.Command {
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "gc",
-		Short: "Remove stacks whose worktree no longer exists, including their volumes",
+		Short: "Remove stacks whose worktree is gone and stop idle test stacks",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			reg, err := a.openRegistry()
@@ -576,11 +703,46 @@ func (a *app) gcCmd() *cobra.Command {
 				return err
 			}
 			out := cmd.OutOrStdout()
-			// One stack that cannot be removed must not keep the rest.
+			now := a.clock()
+			// One stack that cannot be removed or stopped must not keep the rest.
 			var errs []error
 			for _, e := range entries {
 				switch worktreeState(e.Root) {
 				case worktreePresent:
+					if !e.IsIdleAt(now) {
+						continue
+					}
+					useLock, err := reg.TryLockIdle(e.Project)
+					if err != nil {
+						errs = append(errs, err)
+						continue
+					}
+					if useLock == nil {
+						continue
+					}
+					fresh, ok, err := reg.Get(e.Project)
+					if err != nil {
+						_ = useLock.Unlock()
+						errs = append(errs, err)
+						continue
+					}
+					if !ok || !fresh.IsIdleAt(now) {
+						_ = useLock.Unlock()
+						continue
+					}
+					idleAge := fresh.IdleFor(now).Round(time.Second)
+					if dryRun {
+						_ = useLock.Unlock()
+						fmt.Fprintf(out, "%s: idle for %s; would stop\n", fresh.Project, idleAge)
+						continue
+					}
+					stopErr := a.stopIdle(reg, fresh.Project)
+					_ = useLock.Unlock()
+					if stopErr != nil {
+						errs = append(errs, stopErr)
+						continue
+					}
+					fmt.Fprintf(out, "%s: idle for %s; stopped\n", fresh.Project, idleAge)
 					continue
 				case worktreeUnreachable:
 					fmt.Fprintf(cmd.ErrOrStderr(), "aviary: %s: neither worktree %s nor its parent directory exists; skipped in case it is on a disk that is not mounted (aviary rm --project %s removes it)\n", e.Project, e.Root, e.Project)
@@ -599,8 +761,60 @@ func (a *app) gcCmd() *cobra.Command {
 			return errors.Join(errs...)
 		},
 	}
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would be removed without removing it")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would be removed or stopped without changing anything")
 	return cmd
+}
+
+func (a *app) reapIdleCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "__reap-idle <project>",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.reapIdleProject(args[0])
+		},
+	}
+}
+
+func (a *app) reapIdleProject(project string) error {
+	reg, err := a.openRegistry()
+	if err != nil {
+		return err
+	}
+	reaperLock, err := reg.TryClaimReaper(project)
+	if err != nil || reaperLock == nil {
+		return err
+	}
+	for {
+		useLock, err := reg.TryLockIdle(project)
+		if err != nil {
+			_ = reaperLock.Unlock()
+			return err
+		}
+		if useLock == nil {
+			if err := reg.WaitUseIdle(project); err != nil {
+				_ = reaperLock.Unlock()
+				return err
+			}
+			continue
+		}
+		entry, ok, err := reg.Get(project)
+		if err != nil || !ok || !entry.IsWarm() {
+			_ = reaperLock.Unlock()
+			_ = useLock.Unlock()
+			return err
+		}
+		remaining := entry.IdleDeadline().Sub(a.clock())
+		if remaining > 0 {
+			_ = useLock.Unlock()
+			a.sleepFor(remaining)
+			continue
+		}
+		stopErr := a.stopIdle(reg, project)
+		_ = reaperLock.Unlock()
+		_ = useLock.Unlock()
+		return stopErr
+	}
 }
 
 func (a *app) rmCmd() *cobra.Command {
@@ -655,6 +869,16 @@ func (a *app) remove(reg *registry.Registry, project string) error {
 		return fmt.Errorf("removing %s: %v", project, err)
 	}
 	return reg.Release(project)
+}
+
+// stopIdle stops an idle warm stack's containers while keeping its volumes,
+// ports, and InitializedAt.
+func (a *app) stopIdle(reg *registry.Registry, project string) error {
+	if err := a.stopProject(project); err != nil {
+		return fmt.Errorf("stopping %s: %v", project, err)
+	}
+	_, err := reg.MarkStopped(project)
+	return err
 }
 
 type rootState int

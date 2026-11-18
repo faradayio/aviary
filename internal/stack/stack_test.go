@@ -1138,3 +1138,147 @@ func TestTestStripsSuiteWorkdirPrefixAndWarnsDockerDesktopOnlyForContainers(t *t
 		t.Errorf("container suite stderr missing Docker Desktop warnings:\n%s", stderr.String())
 	}
 }
+
+func TestUpHoldsStackWhileTestWarmsAndDownCools(t *testing.T) {
+	noInit := false
+	noPrepare := false
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		IdleTTL: "10m",
+		Suites: map[string]config.Suite{
+			"popsicle": {
+				Host:    true,
+				Init:    &noInit,
+				Prepare: &noPrepare,
+				Command: []string{"pnpm", "test"},
+			},
+			"unit": {
+				Service: "api",
+				Needs:   []string{"postgres"},
+				Init:    &noInit,
+				Prepare: &noPrepare,
+				Command: []string{"npm", "test"},
+			},
+		},
+	}
+	s, _ := newStack(t, cfg)
+	s.hostRunner = func(string, map[string]string, []string) error { return nil }
+	var spawned []string
+	s.spawnReaper = func(project string) { spawned = append(spawned, project) }
+
+	if err := s.Test("popsicle", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryFor(t, s); got.IsWarm() || got.Held || len(spawned) != 0 {
+		t.Fatalf("after pure host suite: entry=%+v spawned=%v", got, spawned)
+	}
+
+	if err := s.Test("unit", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryFor(t, s); !got.IsWarm() || got.IdleTTL != "10m" || len(spawned) == 0 {
+		t.Fatalf("after container suite: entry=%+v spawned=%v", got, spawned)
+	}
+
+	spawned = nil
+	if err := s.Up(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Test("unit", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryFor(t, s); !got.Held || got.IsWarm() || len(spawned) != 0 {
+		t.Fatalf("after Up + Test: entry=%+v spawned=%v", got, spawned)
+	}
+
+	if err := s.Down(false); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryFor(t, s); got.Held || got.LastUsedAt != nil {
+		t.Fatalf("after Down: entry=%+v, want cold", got)
+	}
+}
+
+func TestFailedUpLeavesAWarmStackWarm(t *testing.T) {
+	noInit := false
+	noPrepare := false
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		Suites: map[string]config.Suite{
+			"unit": {
+				Service: "api",
+				Needs:   []string{"postgres"},
+				Init:    &noInit,
+				Prepare: &noPrepare,
+				Command: []string{"npm", "test"},
+			},
+		},
+	}
+	s, _ := newStack(t, cfg)
+	if err := s.Test("unit", nil); err != nil {
+		t.Fatal(err)
+	}
+	warm := entryFor(t, s)
+	if !warm.IsWarm() {
+		t.Fatalf("suite did not warm the stack: %+v", warm)
+	}
+	var spawned []string
+	s.spawnReaper = func(project string) { spawned = append(spawned, project) }
+	s.runner = func(compose.Stack, ...string) error { return errors.New("unhealthy") }
+	if err := s.Up(nil); err == nil {
+		t.Fatal("Up returned nil")
+	}
+	if got := entryFor(t, s); got.Held || !got.IsWarm() || got.LastUsedAt.Before(*warm.LastUsedAt) || len(spawned) != 1 {
+		t.Fatalf("failed Up on a warm stack: entry=%+v spawned=%v", got, spawned)
+	}
+	if err := s.ComposeHold([]string{"up", "--detach"}); err == nil {
+		t.Fatal("ComposeHold returned nil")
+	}
+	if got := entryFor(t, s); got.Held || !got.IsWarm() {
+		t.Fatalf("failed compose up changed the warm stack: %+v", got)
+	}
+
+	s.runner = func(compose.Stack, ...string) error { return nil }
+	if err := s.Up(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !entryFor(t, s).Held {
+		t.Fatal("successful Up did not hold the stack")
+	}
+}
+
+func TestFailedUpOnAColdStackStartsTheIdleTimer(t *testing.T) {
+	cfg := &config.Config{
+		Compose: config.Compose{Files: []string{"compose.yaml"}},
+		IdleTTL: "10m",
+	}
+	s, _ := newStack(t, cfg)
+	var spawned []string
+	s.spawnReaper = func(project string) { spawned = append(spawned, project) }
+	s.runner = func(compose.Stack, ...string) error { return errors.New("unhealthy") }
+
+	if err := s.Up(nil); err == nil {
+		t.Fatal("Up returned nil")
+	}
+	if got := entryFor(t, s); got.Held || !got.IsWarm() || got.IdleTTL != "10m" || len(spawned) != 1 {
+		t.Fatalf("failed cold Up: entry=%+v spawned=%v", got, spawned)
+	}
+}
+
+func TestFailedUpOnAHeldStackStaysHeld(t *testing.T) {
+	cfg := &config.Config{Compose: config.Compose{Files: []string{"compose.yaml"}}}
+	s, _ := newStack(t, cfg)
+	if err := s.Up(nil); err != nil {
+		t.Fatal(err)
+	}
+	var spawned []string
+	s.spawnReaper = func(project string) { spawned = append(spawned, project) }
+	s.runner = func(compose.Stack, ...string) error { return errors.New("unhealthy") }
+
+	if err := s.Up(nil); err == nil {
+		t.Fatal("Up returned nil")
+	}
+	if got := entryFor(t, s); !got.Held || got.IsWarm() || len(spawned) != 0 {
+		t.Fatalf("failed Up on a held stack: entry=%+v spawned=%v", got, spawned)
+	}
+}

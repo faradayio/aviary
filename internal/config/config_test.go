@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -119,6 +120,13 @@ suites:
 	}
 	if cfg.Vault == nil || cfg.Vault.Addr != "https://vault2.faraday.ai" || cfg.Vault.TTL != "8h" {
 		t.Errorf("vault = %+v", cfg.Vault)
+	}
+	if got := cfg.IdleDuration(); got != DefaultIdleTTL {
+		t.Errorf("default IdleDuration() = %v, want %v", got, DefaultIdleTTL)
+	}
+	custom, err := Load(write(t, "compose:\n  files: [compose.yaml]\nidle_ttl: 15m\n"))
+	if err != nil || custom.IdleDuration() != 15*time.Minute {
+		t.Errorf("custom idle_ttl: cfg=%+v err=%v", custom, err)
 	}
 	hf := cfg.HostEnv["FDY_GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH"]
 	if !hf.Required || hf.Hint != "run gcloud auth application-default login" {
@@ -249,6 +257,9 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"vault without addr":                 {base + "vault: {ttl: 8h}\n", "vault: needs addr"},
 		"vault with bad addr":                {base + "vault: {addr: vault2.faraday.ai}\n", "must be an http or https URL"},
 		"vault with negative ttl":            {base + "vault: {addr: https://vault.test, ttl: -1h}\n", "positive Go duration"},
+		"idle_ttl negative":                  {base + "idle_ttl: -5m\n", "positive Go duration"},
+		"idle_ttl zero":                      {base + "idle_ttl: 0s\n", "positive Go duration"},
+		"idle_ttl invalid":                   {base + "idle_ttl: soon\n", "positive Go duration"},
 		"host_env without path":              {base + "host_env:\n  FOO: {required: true}\n", `host_env["FOO"]: needs path`},
 		"prepare without command":            {base + "prepare:\n  - {}\n", "prepare[0]: needs a command"},
 		"host suite with service":            {base + "suites:\n  s: {host: true, service: api, command: [t]}\n", "host suite must not set service"},

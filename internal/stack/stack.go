@@ -5,6 +5,7 @@
 package stack
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -46,6 +47,8 @@ type Stack struct {
 	resolver func(c compose.Stack) (*compose.Resolved, error)
 	// hostRunner is Options.HostRunner.
 	hostRunner func(dir string, extraEnv map[string]string, command []string) error
+	// spawnReaper is Options.SpawnReaper.
+	spawnReaper func(project string)
 	// snapshots caches seeded volumes when Config.Snapshot is set.
 	snapshots *snapshot.Store
 	// dockerSettings holds local Docker Desktop settings on Apple silicon.
@@ -53,6 +56,8 @@ type Stack struct {
 	warnedDocker   bool
 	// prepared is set once this Stack has run the prepare steps.
 	prepared bool
+	// inUse is set while this Stack holds a UseLease so nested calls share it.
+	inUse bool
 	// stderr receives aviary's progress lines for init steps.
 	stderr io.Writer
 }
@@ -80,6 +85,9 @@ type Options struct {
 	// HostRunner runs a command on the host in dir. It defaults to
 	// compose.RunHost; tests replace it to record host commands.
 	HostRunner func(dir string, extraEnv map[string]string, command []string) error
+	// SpawnReaper starts a detached background idle reaper for project when a
+	// warm stack is used. Nil disables spawning (for unit tests).
+	SpawnReaper func(project string)
 	// SnapshotStore overrides the default XDG snapshot cache during tests.
 	SnapshotStore *snapshot.Store
 	// VaultToken overrides Vault token minting during tests. When nil and
@@ -173,6 +181,7 @@ func Load(cwd, configDir string, opts Options) (*Stack, error) {
 		runner:         runner,
 		resolver:       resolver,
 		hostRunner:     hostRunner,
+		spawnReaper:    opts.SpawnReaper,
 		snapshots:      opts.SnapshotStore,
 		dockerSettings: dockerSettings,
 		stderr:         os.Stderr,
@@ -341,6 +350,116 @@ func (s *Stack) run(extraProfiles []string, args ...string) error {
 	return s.runner(c, args...)
 }
 
+// Up starts the stack (or the named services) and waits until healthy. Held
+// is set only after that succeeds. A failed up starts the idle timer, unless
+// the stack is already held. A held stack stays up until Down or rm.
+func (s *Stack) Up(args []string) error {
+	lease, err := s.registry.BeginHold(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	defer lease.Finish()
+	s.Entry = lease.Entry
+	s.WarnDockerDesktop()
+	if err := s.Prepare(); err != nil {
+		return err
+	}
+	if err := s.run(nil, append([]string{"up", "--detach", "--wait"}, args...)...); err != nil {
+		return s.markUsed(err)
+	}
+	entry, err := s.registry.MarkHeld(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	s.Entry = entry
+	return nil
+}
+
+// RunOneOff runs a one-off command in a fresh container (`aviary run`), marking
+// the stack warm so any dependency services it started cool down after idle_ttl.
+func (s *Stack) RunOneOff(args []string) error {
+	return s.withUse(func() error {
+		s.WarnDockerDesktop()
+		if err := s.Prepare(); err != nil {
+			return err
+		}
+		return s.run(nil, append([]string{"run", "--rm"}, args...)...)
+	})
+}
+
+// ComposeHold runs `aviary compose up`. The stack is marked held only after
+// the command succeeds, same as Up.
+func (s *Stack) ComposeHold(args []string) error {
+	lease, err := s.registry.BeginHold(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	defer lease.Finish()
+	s.Entry = lease.Entry
+	s.WarnDockerDesktop()
+	if err := s.run(nil, args...); err != nil {
+		return s.markUsed(err)
+	}
+	entry, err := s.registry.MarkHeld(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	s.Entry = entry
+	return nil
+}
+
+// markUsed starts the idle timer after a start command fails. A stack that
+// is already held stays held, so its containers are not reaped.
+func (s *Stack) markUsed(cause error) error {
+	updated, err := s.registry.MarkUsed(s.Workspace.Project(), s.Config.IdleTTL)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	if updated == nil {
+		return cause
+	}
+	s.Entry = *updated
+	if updated.IsWarm() && s.spawnReaper != nil {
+		s.spawnReaper(s.Workspace.Project())
+	}
+	return cause
+}
+
+// ComposeUse forwards an `aviary compose run` invocation under a transient UseLease.
+func (s *Stack) ComposeUse(args []string) error {
+	return s.withUse(func() error {
+		s.WarnDockerDesktop()
+		return s.run(nil, args...)
+	})
+}
+
+func (s *Stack) withUse(fn func() error) (err error) {
+	if s.inUse {
+		return fn()
+	}
+	lease, err := s.registry.BeginUse(s.Workspace.Project(), s.Config.IdleTTL)
+	if err != nil {
+		return err
+	}
+	s.Entry = lease.Entry
+	s.inUse = true
+	defer func() {
+		s.inUse = false
+		updated, finishErr := lease.Finish()
+		if finishErr == nil && updated != nil {
+			s.Entry = *updated
+			if updated.IsWarm() && s.spawnReaper != nil {
+				s.spawnReaper(s.Workspace.Project())
+			}
+		}
+		if err == nil {
+			err = finishErr
+		}
+	}()
+	err = fn()
+	return err
+}
+
 // Prepare runs the host prepare steps from aviary.yml in the worktree root,
 // under the stack's lock so two aviary commands in one worktree never run
 // them at once.
@@ -377,6 +496,30 @@ func (s *Stack) prepareLocked() error {
 // inspection. It holds the stack's lock throughout, so a second aviary in the
 // same worktree waits and then finds init done instead of running it again.
 func (s *Stack) Init(force bool) error {
+	if !s.inUse && !force {
+		done, err := s.alreadyInitialized()
+		if err != nil || done {
+			return err
+		}
+	}
+	return s.withUse(func() error {
+		return s.initLocked(force)
+	})
+}
+
+func (s *Stack) alreadyInitialized() (bool, error) {
+	unlock, err := s.registry.LockProject(s.Workspace.Project())
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if err := s.reload(); err != nil {
+		return false, err
+	}
+	return s.Entry.InitializedAt != nil, nil
+}
+
+func (s *Stack) initLocked(force bool) error {
 	unlock, err := s.registry.LockProject(s.Workspace.Project())
 	if err != nil {
 		return err
@@ -523,50 +666,56 @@ func (s *Stack) Test(name string, extra []string) error {
 		return fmt.Errorf("no suite %q; available: %s", name, strings.Join(names, ", "))
 	}
 	s.announceTest(name, suite)
-	if suite.WantsPrepare() {
-		if err := s.Prepare(); err != nil {
-			return err
+	runSuite := func() error {
+		if suite.WantsPrepare() {
+			if err := s.Prepare(); err != nil {
+				return err
+			}
 		}
-	}
-	if suite.WantsInit() {
-		if err := s.Init(false); err != nil {
-			return err
+		if suite.WantsInit() {
+			if err := s.Init(false); err != nil {
+				return err
+			}
 		}
-	}
-	if len(suite.Needs) > 0 || !suite.Host {
-		s.WarnDockerDesktop()
-	}
-	if len(suite.Needs) > 0 {
-		args := append([]string{"up", "--detach", "--wait"}, suite.Needs...)
-		if err := s.run(suite.Profiles, args...); err != nil {
-			return fmt.Errorf("starting %s for suite %q: %v", strings.Join(suite.Needs, ", "), name, err)
+		if len(suite.Needs) > 0 || !suite.Host {
+			s.WarnDockerDesktop()
 		}
-	}
-	if len(extra) > 0 && extra[0] == "--" {
-		extra = extra[1:]
-	}
-	callerDir := s.Cwd
-	if callerDir == "" {
-		callerDir = s.Workspace.Root
-	}
-	extra = suite.NormalizeArgs(s.Workspace.Root, callerDir, extra)
-	if suite.Host {
-		dir := s.Workspace.Root
-		if suite.Workdir != "" {
-			dir = filepath.Join(dir, suite.Workdir)
+		if len(suite.Needs) > 0 {
+			args := append([]string{"up", "--detach", "--wait"}, suite.Needs...)
+			if err := s.run(suite.Profiles, args...); err != nil {
+				return fmt.Errorf("starting %s for suite %q: %v", strings.Join(suite.Needs, ", "), name, err)
+			}
 		}
-		return s.hostRunner(dir, s.composeEnv(suite.Env), slices.Concat(suite.Command, extra))
+		if len(extra) > 0 && extra[0] == "--" {
+			extra = extra[1:]
+		}
+		callerDir := s.Cwd
+		if callerDir == "" {
+			callerDir = s.Workspace.Root
+		}
+		extra = suite.NormalizeArgs(s.Workspace.Root, callerDir, extra)
+		if suite.Host {
+			dir := s.Workspace.Root
+			if suite.Workdir != "" {
+				dir = filepath.Join(dir, suite.Workdir)
+			}
+			return s.hostRunner(dir, s.composeEnv(suite.Env), slices.Concat(suite.Command, extra))
+		}
+		// `--env KEY` with no value makes compose read the value from its own
+		// environment, so values never appear in the process list.
+		envFlags := make([]string, 0, len(suite.Env)*2)
+		for _, k := range slices.Sorted(maps.Keys(suite.Env)) {
+			envFlags = append(envFlags, "--env", k)
+		}
+		c := s.Compose()
+		c.Profiles = slices.Concat(c.Profiles, suite.Profiles)
+		c.Env = s.composeEnv(suite.Env)
+		return s.runner(c, slices.Concat([]string{"run", "--rm"}, envFlags, []string{suite.Service}, suite.Command, extra)...)
 	}
-	// `--env KEY` with no value makes compose read the value from its own
-	// environment, so values never appear in the process list.
-	envFlags := make([]string, 0, len(suite.Env)*2)
-	for _, k := range slices.Sorted(maps.Keys(suite.Env)) {
-		envFlags = append(envFlags, "--env", k)
+	if suite.UsesContainers() {
+		return s.withUse(runSuite)
 	}
-	c := s.Compose()
-	c.Profiles = slices.Concat(c.Profiles, suite.Profiles)
-	c.Env = s.composeEnv(suite.Env)
-	return s.runner(c, slices.Concat([]string{"run", "--rm"}, envFlags, []string{suite.Service}, suite.Command, extra)...)
+	return runSuite()
 }
 
 // announceTest names the suite and says whether init will run, before prepare
@@ -589,10 +738,27 @@ func (s *Stack) SuiteNames() []string {
 func (s *Stack) Down(volumes bool) error {
 	args := []string{"down", "--remove-orphans"}
 	if !volumes {
-		return s.run(nil, args...)
+		if err := s.run(nil, args...); err != nil {
+			return err
+		}
+		return s.MarkStopped()
 	}
 	args = append(args, "--volumes")
 	return s.RemoveVolumes(func() error { return s.run(nil, args...) })
+}
+
+// MarkStopped records that the stack's containers have been stopped, clearing
+// Held and LastUsedAt while keeping volumes, ports, and InitializedAt. An
+// unregistered stack stays unregistered.
+func (s *Stack) MarkStopped() error {
+	updated, err := s.registry.MarkStopped(s.Workspace.Project())
+	if err != nil {
+		return err
+	}
+	if updated != nil {
+		s.Entry = *updated
+	}
+	return nil
 }
 
 // RemoveVolumes runs remove, a compose call that deletes the stack's
@@ -607,6 +773,9 @@ func (s *Stack) RemoveVolumes(remove func() error) error {
 	}
 	defer unlock()
 	if err := remove(); err != nil {
+		return err
+	}
+	if err := s.MarkStopped(); err != nil {
 		return err
 	}
 	if err := s.reload(); err != nil {

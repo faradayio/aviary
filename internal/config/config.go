@@ -19,10 +19,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const FileName = "aviary.yml"
+const (
+	FileName       = "aviary.yml"
+	DefaultIdleTTL = 20 * time.Minute
+)
 
 type Config struct {
 	Compose Compose `yaml:"compose"`
+	// IdleTTL is how long containers started transiently (`test`, `init`,
+	// `run`) stay warm after the command exits before aviary stops them
+	// while keeping their volumes (default 20m). Stacks started with `up`
+	// stay running until `down`.
+	IdleTTL string `yaml:"idle_ttl,omitempty"`
 	// Ports names the host ports a worktree's stack publishes. Each name
 	// becomes an AVIARY_PORT_<NAME> variable for compose interpolation.
 	Ports []string `yaml:"ports"`
@@ -149,6 +157,25 @@ func (s Suite) WantsPrepare() bool {
 	return s.Prepare == nil || *s.Prepare
 }
 
+// UsesContainers reports whether running the suite starts or runs any Docker
+// container. Pure host suites (`host: true`, `init: false`, no `needs`) never
+// touch Docker.
+func (s Suite) UsesContainers() bool {
+	return s.WantsInit() || len(s.Needs) > 0 || !s.Host
+}
+
+// IdleDuration returns the configured idle TTL or DefaultIdleTTL when unset.
+func (c *Config) IdleDuration() time.Duration {
+	if c.IdleTTL == "" {
+		return DefaultIdleTTL
+	}
+	d, err := time.ParseDuration(c.IdleTTL)
+	if err != nil || d <= 0 {
+		return DefaultIdleTTL
+	}
+	return d
+}
+
 var (
 	portName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 	envName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -182,6 +209,12 @@ func (c *Config) validate() error {
 	}
 	if err := noEmpty("compose.profiles", c.Compose.Profiles); err != nil {
 		return err
+	}
+	if c.IdleTTL != "" {
+		d, err := time.ParseDuration(c.IdleTTL)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("idle_ttl %q must be a positive Go duration (such as 20m)", c.IdleTTL)
+		}
 	}
 	seen := map[string]bool{}
 	for _, name := range c.Ports {

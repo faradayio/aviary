@@ -281,6 +281,93 @@ suites:
 	}
 }
 
+func TestIdleWarmStackAutoStopsWhileKeepingVolume(t *testing.T) {
+	if out, err := exec.Command("docker", "compose", "version").CombinedOutput(); err != nil {
+		t.Fatalf("the integration test needs docker compose: %v\n%s", err, out)
+	}
+
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "aviary")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	worktree := filepath.Join(tmp, "warm")
+	if err := os.CopyFS(worktree, os.DirFS(filepath.Join("..", "..", "examples", "minimal"))); err != nil {
+		t.Fatal(err)
+	}
+	const aviaryYml = `compose:
+  files: [compose.yaml]
+idle_ttl: 2s
+ports: [postgres, redis]
+init:
+  - service: client
+    command: [psql, -c, "CREATE TABLE items (n int); INSERT INTO items VALUES (1), (2)"]
+suites:
+  db:
+    service: client
+    needs: [postgres]
+    command: [psql, -tAc, "SELECT count(*) FROM items"]
+`
+	if err := os.WriteFile(filepath.Join(worktree, "aviary.yml"), []byte(aviaryYml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := append(withoutAviaryVars(os.Environ()),
+		"XDG_STATE_HOME="+filepath.Join(tmp, "state"),
+		"XDG_CACHE_HOME="+filepath.Join(tmp, "cache"),
+	)
+	run := func(args ...string) string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, args...)
+		cmd.Dir = worktree
+		cmd.Env = env
+		var outBuf, errBuf bytes.Buffer
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("aviary %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, &outBuf, &errBuf)
+		}
+		return outBuf.String()
+	}
+
+	var envOut map[string]string
+	if err := json.Unmarshal([]byte(run("env", "--json")), &envOut); err != nil {
+		t.Fatal(err)
+	}
+	project := envOut["AVIARY_PROJECT"]
+	t.Cleanup(func() { _ = compose.DownProject(project) })
+
+	if got := lastLine(run("test", "db")); got != "2" {
+		t.Fatalf("first test db = %q, want 2", got)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	stopped := false
+	for time.Now().Before(deadline) {
+		var rows []stackRow
+		if err := json.Unmarshal([]byte(run("ls", "--json")), &rows); err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) == 1 && rows[0].Status == "down" && rows[0].LastUsedAt == nil {
+			if !rows[0].Initialized {
+				t.Fatalf("idle stop cleared initialized: %+v", rows[0])
+			}
+			stopped = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if !stopped {
+		t.Fatalf("warm stack %s was not auto-stopped within 20s:\n%s", project, run("ls", "--json"))
+	}
+
+	if got := lastLine(run("test", "db")); got != "2" {
+		t.Fatalf("second test db after idle stop = %q, want 2", got)
+	}
+	run("rm")
+}
+
 // withoutAviaryVars drops variables that would point the binary at a
 // different definition or registry than the test's.
 func withoutAviaryVars(environ []string) []string {

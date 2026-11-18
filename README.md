@@ -377,9 +377,12 @@ calls: the `up` of its needs and the `run` of its command.
 Run from anywhere inside a worktree. `aviary <command> --help` describes each.
 
 - `aviary up [--build] [service...]` starts the stack, or the named services,
-  detached, and waits until they are healthy.
+  detached, waits until they are healthy, and holds the stack running until
+  `aviary down` or `aviary rm`.
 - `aviary down` stops it and keeps its volumes; `--volumes` removes them too.
 - `aviary test <suite> [args...]` runs a suite; with no suite it lists them.
+  Services started for a suite stay warm across re-runs and stop automatically
+  after `idle_ttl` (default `20m`) unless the stack is held by `aviary up`.
 - `aviary init [--force]` runs the init steps by hand.
 - `aviary pull [service...]` pulls the stack's images across every profile
   (using `gcloud` Application Default Credentials automatically when present so
@@ -395,9 +398,10 @@ Run from anywhere inside a worktree. `aviary <command> --help` describes each.
   `eval "$(aviary env --export)"` puts them in your shell, and `--json` prints
   them as an object.
 - `aviary ls [--json]` lists every aviary stack on the machine.
-- `aviary gc [--dry-run]` removes every stack whose worktree directory is gone,
-  volumes included, and releases its ports (see
-  [Directories deleted by hand](#directories-deleted-by-hand)).
+- `aviary gc [--dry-run]` removes every stack whose worktree directory is gone
+  (volumes included, releasing its ports; see
+  [Directories deleted by hand](#directories-deleted-by-hand)), and stops warm
+  stacks idle past `idle_ttl` (keeping their volumes and ports).
 - `aviary rm [--project <name>]` removes this worktree's stack, or the named
   one, with its volumes, and releases its ports. The next command that starts
   it usually gets the same ports back.
@@ -430,8 +434,10 @@ status 1.
 | `branch`           | string  | current git branch of the root, empty when unknown or detached                                                     |
 | `worktree_missing` | boolean | the root no longer exists; `aviary gc` will remove the stack                                                       |
 | `initialized`      | boolean | init has run since the stack was created or aviary last removed its volumes                                        |
+| `held`             | boolean | started by `aviary up` or `aviary compose up`, until `down`, a whole-stack `stop`, or `rm`                         |
 | `created_at`       | string  | when the stack was registered, RFC 3339, or `null` when the registry has no time                                   |
 | `initialized_at`   | string  | when init last completed, RFC 3339, or `null` while `initialized` is false                                         |
+| `last_used_at`     | string  | when `test`, `init` or `run` last used the stack since it was stopped, RFC 3339, or `null`                         |
 | `ports`            | object  | port name to host port                                                                                             |
 | `config`           | string  | `in-tree`, or the external definition directory                                                                    |
 

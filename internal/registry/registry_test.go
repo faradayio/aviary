@@ -299,7 +299,7 @@ func TestFileCarriesVersionAndEntryKeys(t *testing.T) {
 
 func TestUnknownVersionIsAnErrorNamingThePath(t *testing.T) {
 	for name, body := range map[string]string{
-		"future":  `{"version": 2, "entries": {}}`,
+		"future":  `{"version": 3, "entries": {}}`,
 		"missing": `{"entries": {}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -323,6 +323,55 @@ func TestUnknownVersionIsAnErrorNamingThePath(t *testing.T) {
 				t.Errorf("a file with an unknown version must not be rewritten, now %s", after)
 			}
 		})
+	}
+}
+
+func TestVersion1IsReadAndTheNextWriteSavesVersion2(t *testing.T) {
+	reg := open(t)
+	body := `{
+  "version": 1,
+  "entries": {
+    "aviary-a": {
+      "project": "aviary-a",
+      "root": "/wt/a",
+      "config": "",
+      "ports": {"postgres": 20000},
+      "created_at": "2026-01-01T00:00:00Z"
+    }
+  }
+}`
+	if err := os.WriteFile(reg.Path(), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reg.List()
+	if err != nil || len(entries) != 1 || entries[0].Project != "aviary-a" || entries[0].Ports["postgres"] != 20000 {
+		t.Fatalf("List of a version 1 registry = (%+v, %v)", entries, err)
+	}
+	afterList, err := os.ReadFile(reg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterList) != body {
+		t.Fatalf("List rewrote a version 1 registry:\n%s", afterList)
+	}
+	if _, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(reg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Version int `json:"version"`
+		Entries map[string]struct {
+			Ports map[string]int `json:"ports"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	if file.Version != Version || file.Entries["aviary-a"].Ports["postgres"] != 20000 {
+		t.Fatalf("after write = %+v, want version %d and the same port", file, Version)
 	}
 }
 
@@ -607,4 +656,117 @@ func TestLockProjectExcludesASecondHolderUntilReleased(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the second LockProject did not get the lock after the first released it")
 	}
+}
+
+func TestUseLeasesShareLockBlockIdleReaperAndTrackHeldVsWarm(t *testing.T) {
+	reg := open(t)
+	now := time.Date(2026, 11, 17, 18, 0, 0, 0, time.UTC)
+	reg.Now = func() time.Time { return now }
+
+	initial, err := reg.Allocate("aviary-a", "/wt/a", "", []string{"postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.IsWarm() || initial.IsIdleAt(now.Add(time.Hour)) {
+		t.Fatalf("newly allocated stack should be cold, got %+v", initial)
+	}
+
+	lease1, err := reg.BeginUse("aviary-a", "15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	lease2, err := reg.BeginUse("aviary-a", "15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idleLock, err := reg.TryLockIdle("aviary-a")
+	if err != nil || idleLock != nil {
+		t.Fatalf("TryLockIdle while in use = (%v, %v), want (nil, nil)", idleLock, err)
+	}
+
+	if _, err := lease1.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if idleLock, err := reg.TryLockIdle("aviary-a"); err != nil || idleLock != nil {
+		t.Fatalf("TryLockIdle with second lease still held = (%v, %v), want (nil, nil)", idleLock, err)
+	}
+
+	now = now.Add(4 * time.Minute)
+	finished, err := lease2.Finish()
+	if err != nil || finished == nil {
+		t.Fatalf("lease2.Finish() = (%+v, %v)", finished, err)
+	}
+	if !finished.IsWarm() || finished.IsIdleAt(now.Add(14*time.Minute)) || !finished.IsIdleAt(now.Add(15*time.Minute)) {
+		t.Fatalf("unexpected warm window on %+v at %v", *finished, now)
+	}
+	idleLock, err = reg.TryLockIdle("aviary-a")
+	if err != nil || idleLock == nil {
+		t.Fatalf("TryLockIdle after Finish = (%v, %v), want acquired lock", idleLock, err)
+	}
+	if err := idleLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+
+	holdLease, err := reg.BeginHold("aviary-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.MarkHeld("aviary-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holdLease.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	useOnHeld, err := reg.BeginUse("aviary-a", "15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldAfterUse, err := useOnHeld.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !heldAfterUse.Held || heldAfterUse.IsWarm() || heldAfterUse.IsIdleAt(now.Add(24*time.Hour)) {
+		t.Fatalf("held stack became warm or idle: %+v", *heldAfterUse)
+	}
+
+	if _, err := reg.SetInitialized("aviary-a", true); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := reg.MarkStopped("aviary-a")
+	if err != nil || stopped == nil {
+		t.Fatalf("MarkStopped = (%+v, %v)", stopped, err)
+	}
+	if stopped.Held || stopped.LastUsedAt != nil || stopped.InitializedAt == nil || stopped.Ports["postgres"] == 0 {
+		t.Fatalf("MarkStopped entry = %+v", *stopped)
+	}
+	unreg, err := reg.MarkStopped("aviary-unregistered")
+	if err != nil || unreg != nil {
+		t.Fatalf("MarkStopped on unregistered project = (%+v, %v), want (nil, nil)", unreg, err)
+	}
+}
+
+func TestTryClaimReaperAllowsOnlyOneHolderPerProject(t *testing.T) {
+	reg := open(t)
+	first, err := reg.TryClaimReaper("aviary-a")
+	if err != nil || first == nil {
+		t.Fatalf("first TryClaimReaper = (%v, %v)", first, err)
+	}
+	second, err := reg.TryClaimReaper("aviary-a")
+	if err != nil || second != nil {
+		t.Fatalf("second TryClaimReaper = (%v, %v), want (nil, nil)", second, err)
+	}
+	other, err := reg.TryClaimReaper("aviary-b")
+	if err != nil || other == nil {
+		t.Fatalf("other project TryClaimReaper = (%v, %v)", other, err)
+	}
+	_ = other.Unlock()
+	if err := first.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := reg.TryClaimReaper("aviary-a")
+	if err != nil || again == nil {
+		t.Fatalf("TryClaimReaper after unlock = (%v, %v)", again, err)
+	}
+	_ = again.Unlock()
 }

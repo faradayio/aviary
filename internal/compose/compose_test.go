@@ -215,6 +215,10 @@ func TestDownProjectArgsUseNameOnly(t *testing.T) {
 	if got := downProjectArgs("aviary-gone-ffffff"); !slices.Equal(got, want) {
 		t.Fatalf("downProjectArgs = %q, want %q", got, want)
 	}
+	wantStop := []string{"compose", "--project-name", "aviary-warm-ffffff", "down", "--remove-orphans"}
+	if got := stopProjectArgs("aviary-warm-ffffff"); !slices.Equal(got, wantStop) {
+		t.Fatalf("stopProjectArgs = %q, want %q", got, wantStop)
+	}
 }
 
 func TestValidProjectName(t *testing.T) {

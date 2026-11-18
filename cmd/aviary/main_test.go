@@ -34,6 +34,11 @@ type harness struct {
 	listErr  error
 	downed   []string
 	downErr  error
+	stopped  []string
+	stopErr  error
+	spawned  []string
+	sleeps   []time.Duration
+	now      time.Time
 	composed []composeCall
 	// goneRoot is the deleted worktree lsFixture registers.
 	goneRoot string
@@ -48,8 +53,12 @@ type composeCall struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{reg: registry.OpenAt(filepath.Join(t.TempDir(), "registry.json"))}
+	h := &harness{
+		reg: registry.OpenAt(filepath.Join(t.TempDir(), "registry.json")),
+		now: time.Date(2026, 11, 17, 18, 0, 0, 0, time.UTC),
+	}
 	h.reg.Prober = allFree{}
+	h.reg.Now = func() time.Time { return h.now }
 	h.app = &app{
 		openRegistry: func() (*registry.Registry, error) { return h.reg, nil },
 		listProjects: func() ([]compose.Project, error) { return h.projects, h.listErr },
@@ -57,11 +66,20 @@ func newHarness(t *testing.T) *harness {
 			h.downed = append(h.downed, name)
 			return h.downErr
 		},
+		stopProject: func(name string) error {
+			h.stopped = append(h.stopped, name)
+			return h.stopErr
+		},
 		runCompose: func(c compose.Stack, args ...string) error {
 			h.composed = append(h.composed, composeCall{c, args})
 			return nil
 		},
+		spawnReaper: func(project string) {
+			h.spawned = append(h.spawned, project)
+		},
 		branch: func(root string) string { return "branch-of-" + filepath.Base(root) },
+		now:    func() time.Time { return h.now },
+		sleep:  func(d time.Duration) { h.sleeps = append(h.sleeps, d) },
 	}
 	return h
 }
@@ -243,14 +261,14 @@ func TestLsJSONJoinsRegistryWithComposeStatus(t *testing.T) {
 	want := []map[string]any{
 		{
 			"project": "aviary-gone-222222", "status": "down", "root": h.goneRoot,
-			"branch": "", "worktree_missing": true, "initialized": false,
-			"created_at": gone.CreatedAt.Format(time.RFC3339Nano), "initialized_at": nil,
+			"branch": "", "worktree_missing": true, "initialized": false, "held": false,
+			"created_at": gone.CreatedAt.Format(time.RFC3339Nano), "initialized_at": nil, "last_used_at": nil,
 			"ports": map[string]any{}, "config": "/defs/myrepo",
 		},
 		{
 			"project": "aviary-live-111111", "status": "running(2)", "root": liveRoot,
-			"branch": "branch-of-" + filepath.Base(liveRoot), "worktree_missing": false, "initialized": true,
-			"created_at": live.CreatedAt.Format(time.RFC3339Nano), "initialized_at": live.InitializedAt.Format(time.RFC3339Nano),
+			"branch": "branch-of-" + filepath.Base(liveRoot), "worktree_missing": false, "initialized": true, "held": false,
+			"created_at": live.CreatedAt.Format(time.RFC3339Nano), "initialized_at": live.InitializedAt.Format(time.RFC3339Nano), "last_used_at": nil,
 			"ports":  map[string]any{"postgres": float64(base), "redis": float64(base + 1)},
 			"config": "in-tree",
 		},
@@ -739,6 +757,26 @@ func TestComposeDownVolumesMarksTheStackUninitialized(t *testing.T) {
 	if h.entry(t, project).InitializedAt != nil {
 		t.Error("compose down --volumes left the stack marked initialized")
 	}
+
+	if _, err := h.reg.SetInitialized(project, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.run(t, "compose", "down", "-v=true"); err != nil {
+		t.Fatal(err)
+	}
+	if h.entry(t, project).InitializedAt != nil {
+		t.Error("compose down -v=true left the stack marked initialized")
+	}
+
+	if _, err := h.reg.SetInitialized(project, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.run(t, "compose", "down", "-v", "--volumes=false"); err != nil {
+		t.Fatal(err)
+	}
+	if h.entry(t, project).InitializedAt == nil {
+		t.Error("compose down --volumes=false cleared initialized")
+	}
 }
 
 func TestPullSuppliesPlaceholderPortsWithoutRegisteringOrRequiringEnv(t *testing.T) {
@@ -788,5 +826,252 @@ func TestComposeSubcommandSkipsGlobalFlags(t *testing.T) {
 		if sub != tc.sub || !slices.Equal(rest, tc.rest) {
 			t.Errorf("composeSubcommand(%q) = %q, %q, want %q, %q", tc.args, sub, rest, tc.sub, tc.rest)
 		}
+	}
+}
+
+func TestGCStopsIdleWarmStacksWhileKeepingHeldFreshAndInUseStacks(t *testing.T) {
+	h := newHarness(t)
+
+	expiredRoot, freshRoot, heldRoot, activeRoot := tempDir(t), tempDir(t), tempDir(t), tempDir(t)
+	for name, root := range map[string]string{
+		"aviary-expired-111111": expiredRoot,
+		"aviary-fresh-222222":   freshRoot,
+		"aviary-held-333333":    heldRoot,
+		"aviary-active-444444":  activeRoot,
+	} {
+		h.register(t, name, root, "", "postgres")
+		if _, err := h.reg.SetInitialized(name, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	lease, err := h.reg.BeginUse("aviary-expired-111111", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	holdLease, err := h.reg.BeginHold("aviary-held-333333")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.reg.MarkHeld("aviary-held-333333"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holdLease.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	heldUse, err := h.reg.BeginUse("aviary-held-333333", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := heldUse.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	priorActive, err := h.reg.BeginUse("aviary-active-444444", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := priorActive.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	activeLease, err := h.reg.BeginUse("aviary-active-444444", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activeLease.Finish()
+
+	h.now = h.now.Add(15 * time.Minute)
+	freshLease, err := h.reg.BeginUse("aviary-fresh-222222", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := freshLease.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	h.now = h.now.Add(10 * time.Minute)
+
+	dryOut, err := h.run(t, "gc", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "aviary-expired-111111: idle for 25m0s; would stop\n"; dryOut != want {
+		t.Errorf("gc --dry-run = %q, want %q", dryOut, want)
+	}
+	if len(h.stopped) != 0 {
+		t.Errorf("gc --dry-run stopped %v", h.stopped)
+	}
+
+	out, err := h.run(t, "gc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "aviary-expired-111111: idle for 25m0s; stopped\n"; out != want {
+		t.Errorf("gc = %q, want %q", out, want)
+	}
+	if !slices.Equal(h.stopped, []string{"aviary-expired-111111"}) {
+		t.Errorf("gc stopped %v, want only aviary-expired-111111", h.stopped)
+	}
+	if len(h.downed) != 0 {
+		t.Errorf("gc removed volumes for %v, want none", h.downed)
+	}
+	// Stopping an idle warm stack keeps its registry entry, ports, and InitializedAt,
+	// while clearing LastUsedAt so a second gc does not stop it again.
+	expiredAfter := h.entry(t, "aviary-expired-111111")
+	if expiredAfter.LastUsedAt != nil || expiredAfter.InitializedAt == nil || expiredAfter.Ports["postgres"] == 0 {
+		t.Errorf("expired entry after gc = %+v", expiredAfter)
+	}
+	secondOut, err := h.run(t, "gc")
+	if err != nil || secondOut != "" {
+		t.Errorf("second gc = (%q, %v), want no-op", secondOut, err)
+	}
+}
+
+func TestReapIdleSleepsUntilExtendedDeadlineAndExitsIfHeld(t *testing.T) {
+	h := newHarness(t)
+	root := tempDir(t)
+	h.register(t, "aviary-warm-111111", root, "", "postgres")
+
+	lease, err := h.reg.BeginUse("aviary-warm-111111", "10m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a second test finishing 6m in while the reaper is sleeping.
+	calls := 0
+	h.app.sleep = func(d time.Duration) {
+		h.sleeps = append(h.sleeps, d)
+		calls++
+		if calls == 1 {
+			h.now = h.now.Add(6 * time.Minute)
+			ext, err := h.reg.BeginUse("aviary-warm-111111", "10m")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ext.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(4 * time.Minute)
+			return
+		}
+		h.now = h.now.Add(d)
+	}
+
+	if _, err := h.run(t, "__reap-idle", "aviary-warm-111111"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []time.Duration{10 * time.Minute, 6 * time.Minute}; !slices.Equal(h.sleeps, want) {
+		t.Errorf("sleeps = %v, want %v", h.sleeps, want)
+	}
+	if !slices.Equal(h.stopped, []string{"aviary-warm-111111"}) {
+		t.Errorf("stopped = %v, want [aviary-warm-111111]", h.stopped)
+	}
+	if h.entry(t, "aviary-warm-111111").IsWarm() {
+		t.Error("stack stayed warm after __reap-idle stopped it")
+	}
+
+	// If aviary up holds the stack while the reaper sleeps, __reap-idle exits without stopping it.
+	h.stopped = nil
+	h.sleeps = nil
+	lease2, err := h.reg.BeginUse("aviary-warm-111111", "10m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease2.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	h.app.sleep = func(d time.Duration) {
+		h.now = h.now.Add(d)
+		hold, err := h.reg.BeginHold("aviary-warm-111111")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.reg.MarkHeld("aviary-warm-111111"); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = hold.Finish()
+	}
+	if _, err := h.run(t, "__reap-idle", "aviary-warm-111111"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.stopped) != 0 {
+		t.Errorf("reaper stopped a held stack: %v", h.stopped)
+	}
+}
+
+func TestComposeStopSingleServiceAndDryRunKeepStackState(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\n")
+	t.Chdir(root)
+	h := newHarness(t)
+	if _, err := h.run(t, "up"); err != nil {
+		t.Fatal(err)
+	}
+	project := h.projectNames(t)[0]
+	if _, err := h.reg.SetInitialized(project, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.run(t, "compose", "--dry-run", "down", "--volumes"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.entry(t, project); !got.Held || got.InitializedAt == nil {
+		t.Fatalf("dry-run mutated entry: %+v", got)
+	}
+
+	if _, err := h.run(t, "compose", "stop", "popsicle"); err != nil {
+		t.Fatal(err)
+	}
+	if !h.entry(t, project).Held {
+		t.Fatal("stopping one service cleared Held")
+	}
+
+	if _, err := h.run(t, "compose", "stop", "-t", "5"); err != nil {
+		t.Fatal(err)
+	}
+	if h.entry(t, project).Held {
+		t.Fatal("stopping the whole stack left Held set")
+	}
+}
+
+func TestComposeDownOfOneServiceLeavesTheStack(t *testing.T) {
+	root := tempDir(t)
+	writeDefinition(t, root, "compose: {files: [compose.yaml]}\n")
+	t.Chdir(root)
+	h := newHarness(t)
+	if _, err := h.run(t, "up"); err != nil {
+		t.Fatal(err)
+	}
+	project := h.projectNames(t)[0]
+	if _, err := h.reg.SetInitialized(project, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.run(t, "compose", "down", "postgres"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.entry(t, project); !got.Held || got.InitializedAt == nil {
+		t.Fatalf("down of one service changed the stack: %+v", got)
+	}
+
+	if _, err := h.run(t, "compose", "down", "-v", "postgres"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.entry(t, project); !got.Held || got.InitializedAt == nil {
+		t.Fatalf("down -v of one service changed the stack: %+v", got)
+	}
+
+	if _, err := h.run(t, "compose", "down", "--rmi", "local"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.entry(t, project); got.Held || got.InitializedAt == nil {
+		t.Fatalf("down --rmi local = %+v, want stopped and still initialized", got)
 	}
 }

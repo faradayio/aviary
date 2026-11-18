@@ -247,6 +247,22 @@ func downProjectArgs(name string) []string {
 	return []string{"compose", "--project-name", name, "down", "--volumes", "--remove-orphans"}
 }
 
+// StopProject removes a project's containers and networks while keeping its
+// named volumes, using only its name.
+func StopProject(name string) error {
+	if err := ValidProjectName(name); err != nil {
+		return err
+	}
+	cmd := exec.Command("docker", stopProjectArgs(name)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return exitError(runSignals(cmd))
+}
+
+func stopProjectArgs(name string) []string {
+	return []string{"compose", "--project-name", name, "down", "--remove-orphans"}
+}
+
 // Resolved is the part of `docker compose config` aviary needs: which
 // image each service runs, which named volumes it mounts, and the Docker
 // name of each named volume.
